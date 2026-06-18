@@ -1,5 +1,4 @@
-# go.mod requires go >= 1.24 (tailscale.com v1.82+, which provides
-# the client/local package this fork imports).
+# go.mod requires go >= 1.24.
 FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum* ./
@@ -13,7 +12,7 @@ COPY --from=build /out/pgproxy /pgproxy
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# 5432 = Postgres (Fly 6PN + Tailscale)
+# 5432 = Postgres (Fly 6PN)
 # 8080 = HTTPS CONNECT forward proxy (Fly 6PN only)
 # Both are bound on [::] and gated by source-IP classifier.
 EXPOSE 5432 8080

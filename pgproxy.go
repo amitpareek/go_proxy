@@ -28,70 +28,38 @@ import (
 	"net/http"
 	"os"
 	"time"
-
-	"tailscale.com/client/local"
-	"tailscale.com/metrics"
-	"tailscale.com/tsnet"
-	"tailscale.com/tsweb"
 )
 
 var (
-	hostname     = flag.String("hostname", "", "Tailscale hostname to serve on")
-	debugPort    = flag.Int("debug-port", 80, "Listening port for debug/metrics endpoint")
-	upstreamCA   = flag.String("upstream-ca-file", "", "File containing the PEM-encoded CA certificate for the upstream server")
-	tailscaleDir = flag.String("state-dir", "", "Directory in which to store the Tailscale auth state")
+	debugPort  = flag.Int("debug-port", 80, "Listening port for the debug/metrics + dev page endpoint (Fly 6PN)")
+	upstreamCA = flag.String("upstream-ca-file", "", "File containing the PEM-encoded CA certificate for the upstream server")
 	// EXT: --port and --upstream-addr from upstream are replaced by
 	// the repeatable --upstream flag declared in extensions.go.
 )
 
 func main() {
 	flag.Parse()
-	if *hostname == "" {
-		log.Fatal("missing --hostname")
-	}
 	if *upstreamCA == "" {
 		log.Fatal("missing --upstream-ca-file")
 	}
-	if *tailscaleDir == "" {
-		log.Fatal("missing --state-dir")
-	}
 
-	ts := &tsnet.Server{
-		Dir:      *tailscaleDir,
-		Hostname: *hostname,
-	}
-
-	if os.Getenv("TS_AUTHKEY") == "" {
-		log.Print("Note: you need to run this with TS_AUTHKEY=... the first time, to join your tailnet of choice.")
-	}
-
-	tsclient, err := ts.LocalClient()
-	if err != nil {
-		log.Fatalf("getting tsnet API client: %v", err)
-	}
-
-	// EXT: advertise Fly 6PN subnet routes / exit node and serve
-	// *.internal DNS for the tailnet, if configured.
-	if err := setupTailscaleRouter(context.Background(), ts, tsclient); err != nil {
-		log.Fatalf("tailscale router setup: %v", err)
-	}
-
-	// EXT BEGIN: debug listener exists, but the per-upstream proxy
-	// creation, Expvar publication, and connection listeners are now
-	// driven by runProxies in extensions.go (one proxy per --upstream).
+	// EXT BEGIN: debug listener + dev page, served over Fly 6PN. The
+	// per-upstream proxy creation, Expvar publication, and connection
+	// listeners are driven by runProxies in extensions.go (one proxy per
+	// configured database).
 	var debugMux *http.ServeMux
 	if *debugPort != 0 {
 		debugMux = http.NewServeMux()
-		tsweb.Debugger(debugMux)
+		debugMux.Handle("/debug/vars", expvar.Handler())
 		srv := &http.Server{Handler: debugMux}
-		dln, err := ts.Listen("tcp", fmt.Sprintf(":%d", *debugPort))
+		dln, err := net.Listen("tcp", fmt.Sprintf(":%d", *debugPort))
 		if err != nil {
 			log.Fatal(err)
 		}
 		go func() { log.Fatal(srv.Serve(dln)) }()
 	}
 
-	runProxies(ts, tsclient, *upstreamCA, debugMux)
+	runProxies(*upstreamCA, debugMux)
 	select {}
 	// EXT END
 }
@@ -104,18 +72,17 @@ type proxy struct {
 	upstreamHost     string // "my.database.com"
 	upstreamCertPool *x509.CertPool
 	downstreamCert   []tls.Certificate
-	client           *local.Client
 	cfg              upstreamConfig // EXT: full entry; cfg.managed() picks the serve path
 
 	activeSessions  expvar.Int
 	startedSessions expvar.Int
-	errors          metrics.LabelMap
+	errors          *expvar.Map
 }
 
 // newProxy returns a proxy that forwards connections to
 // upstreamAddr. The upstream's TLS session is verified using the CA
 // cert(s) in upstreamCAPath.
-func newProxy(upstreamAddr, upstreamCAPath string, client *local.Client) (*proxy, error) {
+func newProxy(upstreamAddr, upstreamCAPath string) (*proxy, error) {
 	bs, err := os.ReadFile(upstreamCAPath)
 	if err != nil {
 		return nil, err
@@ -139,24 +106,22 @@ func newProxy(upstreamAddr, upstreamCAPath string, client *local.Client) (*proxy
 		upstreamHost:     h,
 		upstreamCertPool: upstreamCertPool,
 		downstreamCert:   []tls.Certificate{downstreamCert},
-		client:           client,
-		errors:           metrics.LabelMap{Label: "kind"},
+		errors:           new(expvar.Map),
 	}, nil
 }
 
 // Expvar returns p's monitoring metrics.
 func (p *proxy) Expvar() expvar.Var {
-	ret := &metrics.Set{}
+	ret := new(expvar.Map)
 	ret.Set("sessions_active", &p.activeSessions)
 	ret.Set("sessions_started", &p.startedSessions)
-	ret.Set("session_errors", &p.errors)
+	ret.Set("session_errors", p.errors)
 	return ret
 }
 
 // Serve accepts postgres client connections on ln and proxies them to
 // the configured upstream. ln can be any net.Listener, but all client
-// connections must originate from tailscale IPs that can be verified
-// with WhoIs.
+// connections must originate from Fly 6PN addresses (see classifyPeer).
 func (p *proxy) Serve(ln net.Listener) error {
 	var lastSessionID int64
 	for {
@@ -199,7 +164,7 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// EXT BEGIN: peer classification + identity (Tailscale WhoIs or Fly PTR/TXT).
+	// EXT BEGIN: peer classification + identity (Fly 6PN PTR/TXT).
 	user, machine, injectAppName, err := p.identifyClient(ctx, c)
 	if err != nil {
 		return err

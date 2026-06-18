@@ -6,57 +6,11 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
-
-func TestParseAdvertiseRoutes(t *testing.T) {
-	got, err := parseAdvertiseRoutes(" fdaa::/16 , 10.0.0.0/8 ")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := []string{"fdaa::/16", "10.0.0.0/8"}
-	if len(got) != len(want) {
-		t.Fatalf("got %d routes, want %d (%v)", len(got), len(want), got)
-	}
-	for i, w := range want {
-		if got[i].String() != w {
-			t.Errorf("route %d = %q, want %q", i, got[i].String(), w)
-		}
-	}
-
-	if r, err := parseAdvertiseRoutes("   "); err != nil || r != nil {
-		t.Errorf("empty input: got (%v, %v), want (nil, nil)", r, err)
-	}
-
-	if _, err := parseAdvertiseRoutes("not-a-cidr"); err == nil {
-		t.Errorf("expected error for invalid CIDR")
-	}
-}
-
-func TestRouteContains(t *testing.T) {
-	routes, err := parseAdvertiseRoutes("fdaa::/16")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		ip   string
-		want bool
-	}{
-		{"fdaa:74:505b:a7b:86e:790b:be2a:2", true}, // a 6PN app
-		{"fdaa::3", true},                          // fly resolver
-		{"fd7a:115c:a1e0::1", false},               // tailscale ULA
-		{"2606:4700:4700::1111", false},            // public
-	} {
-		ip := netip.MustParseAddr(tc.ip)
-		if got := routeContains(routes, ip); got != tc.want {
-			t.Errorf("routeContains(%s) = %v, want %v", tc.ip, got, tc.want)
-		}
-	}
-}
 
 func TestParseDestinationPgDbs_ManagedEntry(t *testing.T) {
 	list, err := parseDestinationPgDbsJSON(`[
@@ -299,7 +253,7 @@ func TestDevPage_NeverRendersPasswords(t *testing.T) {
 			DBName: "maindb", User: "app_user", Password: "hunter2-secret"},
 		{Name: "admin", Listen: 5439, Target: "ep-x.neon.tech:5432"},
 	}
-	html := string(renderDevPageHTML("pg.tail.ts.net", "pgproxy.internal", cfgs))
+	html := string(renderDevPageHTML("pgproxy.internal", cfgs))
 	if strings.Contains(html, "hunter2-secret") {
 		t.Fatalf("dev page leaks a configured password")
 	}

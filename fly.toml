@@ -3,13 +3,18 @@
 # Before first deploy:
 #
 #   fly apps create pgproxy
-#   fly secrets set TS_AUTHKEY="tskey-auth-..."
 #   fly deploy
 #
-# The proxy will start up with no databases configured. Open
-# http://pgproxy/ (over Tailscale) for the dev reference page and
-# copy the example into a `fly secrets set DESTINATION_PG_DBS='...'`
-# command when you're ready to add databases:
+# pgproxy is a Fly 6PN-only service (no Tailscale). Reach it from other
+# Fly apps over 6PN, or from a Tailscale tailnet via a separate subnet
+# router (e.g. fly-apps/tailscale-router) that bridges the tailnet to
+# Fly 6PN.
+#
+# The proxy will start up with no databases configured. From another Fly
+# app on the 6PN network, open http://pgproxy.internal/ for the dev
+# reference page and copy the example into a
+# `fly secrets set DESTINATION_PG_DBS='...'` command when you're ready
+# to add databases:
 #
 #   fly secrets set DESTINATION_PG_DBS='[
 #     {"name":"rw","listen":5432,
@@ -24,9 +29,6 @@
 # upstream itself and clients connect with no credentials, e.g.
 # postgres://pgproxy.internal:5432/mydb. Entries without are
 # passthrough (client supplies real upstream credentials).
-#
-# Use an *ephemeral + reusable* Tailscale auth key; state lives in
-# /tmp (tmpfs), so each restart re-auths.
 
 app = "pgproxy"
 primary_region = "sin"
@@ -37,14 +39,12 @@ primary_region = "sin"
 [env]
   # Non-secret defaults; uncomment to override.
   # UPSTREAM_CA_FILE = "/etc/ssl/certs/ca-certificates.crt"
-  # STATE_DIR        = "/tmp/tsnet"
-  # TS_HOSTNAME      = "pgproxy"
 
 [[vm]]
   size      = "shared-cpu-1x"
   memory_mb = 512
 
 # No [[services]] block: pgproxy is internal-only. Postgres on the
-# per-database listen ports over 6PN/Tailscale; HTTPS CONNECT proxy
-# on 8080 (Fly 6PN only); debug + dev reference page on 80
-# (Tailscale only).
+# per-database listen ports over Fly 6PN; HTTPS CONNECT proxy on 8080
+# (Fly 6PN only); debug + dev reference page on 80 (Fly 6PN). Reach any
+# of these from the tailnet via a separate Tailscale subnet router.
