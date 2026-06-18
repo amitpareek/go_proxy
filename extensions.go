@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
+	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
 )
 
@@ -71,7 +72,194 @@ var (
 	destinationPgDbs = flag.String("destination-pg-dbs", "", `JSON array of {"name","listen","target"} entries. Empty is allowed.`)
 	flyListenHost    = flag.String("fly-listen-host", "[::]", "Host (no port) to bind Fly 6PN listeners on. Empty disables Fly listeners.")
 	httpProxyListen  = flag.String("http-proxy-listen", "[::]:8080", "Kernel TCP listen address for the HTTPS CONNECT forward proxy. Empty disables.")
+
+	advertiseRoutes   = flag.String("advertise-routes", "", "Comma-separated CIDRs to advertise as a subnet router (e.g. Fly 6PN fdaa::/16). Empty advertises none.")
+	advertiseExitNode = flag.Bool("advertise-exit-node", false, "Advertise this node as a Tailscale exit node (adds 0.0.0.0/0 and ::/0).")
+	flyDNSResolver    = flag.String("fly-dns-resolver", "", `Upstream Fly internal DNS resolver (e.g. "[fdaa::3]:53"). When set, serve DNS on the node's Tailscale IPs (:53 UDP+TCP) and forward queries here, so tailnet clients with split DNS can resolve *.internal. Empty disables.`)
 )
+
+// setupTailscaleRouter turns this tsnet node into a Fly 6PN router for
+// the tailnet. With --advertise-routes / --advertise-exit-node it
+// announces subnet routes (and/or the exit node); with --fly-dns-resolver
+// it also serves DNS that forwards to Fly's internal resolver so clients
+// can resolve <app>.internal names. tsnet runs netstack with
+// ProcessSubnets and ProcessLocalIPs enabled, so advertised traffic is
+// actually forwarded out via the host network.
+//
+// To actually reach a Fly app over Tailscale you need BOTH halves:
+//   - the route, so the resolved fdaa::/16 address is reachable; and
+//   - the DNS forwarder + Tailscale split DNS (admin console > DNS > add
+//     nameserver = this node's Tailscale IP, restricted to search domain
+//     "internal"), so the name resolves at all.
+//
+// Routes/exit nodes still have to be approved in the tailnet before they
+// carry traffic: tick them in the admin console or grant the node's tags
+// an autoApprovers ACL.
+//
+// When nothing is configured this is a no-op and the node starts lazily
+// via the first Listen, exactly as upstream pgproxy does.
+func setupTailscaleRouter(ctx context.Context, ts *tsnet.Server, tsclient *local.Client) error {
+	routes, err := parseAdvertiseRoutes(*advertiseRoutes)
+	if err != nil {
+		return err
+	}
+	wantPrefs := len(routes) > 0 || *advertiseExitNode
+	resolver := strings.TrimSpace(*flyDNSResolver)
+	wantDNS := resolver != ""
+	if !wantPrefs && !wantDNS {
+		return nil
+	}
+
+	// Wait until the node is Running before editing prefs / reading the
+	// node's Tailscale IPs.
+	if _, err := ts.Up(ctx); err != nil {
+		return fmt.Errorf("bringing tailscale up: %w", err)
+	}
+
+	if wantPrefs {
+		prefs := &ipn.Prefs{AdvertiseRoutes: routes}
+		if *advertiseExitNode {
+			prefs.SetAdvertiseExitNode(true) // appends 0.0.0.0/0 and ::/0
+		}
+		if _, err := tsclient.EditPrefs(ctx, &ipn.MaskedPrefs{
+			Prefs:              *prefs,
+			AdvertiseRoutesSet: true,
+		}); err != nil {
+			return fmt.Errorf("advertising routes: %w", err)
+		}
+		log.Printf("advertising routes %v (exit node: %v)", prefs.AdvertiseRoutes, *advertiseExitNode)
+	}
+
+	if wantDNS {
+		if err := serveFlyDNS(ctx, ts, tsclient, resolver); err != nil {
+			return fmt.Errorf("serving DNS: %w", err)
+		}
+	}
+	return nil
+}
+
+// serveFlyDNS listens on every Tailscale IP of the node (port 53, both
+// UDP and TCP) and forwards each query verbatim to Fly's internal
+// resolver at resolverAddr. DNS messages are opaque to us — we just
+// shuttle bytes — so no DNS library is needed. Point Tailscale split DNS
+// at one of these IPs for the "internal" search domain and *.internal
+// names resolve to their 6PN addresses.
+func serveFlyDNS(ctx context.Context, ts *tsnet.Server, tsclient *local.Client, resolverAddr string) error {
+	st, err := tsclient.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("getting tailscale status: %w", err)
+	}
+	if len(st.TailscaleIPs) == 0 {
+		return fmt.Errorf("node has no Tailscale IPs yet")
+	}
+	for _, ip := range st.TailscaleIPs {
+		addr := net.JoinHostPort(ip.String(), "53")
+
+		pc, err := ts.ListenPacket("udp", addr)
+		if err != nil {
+			return fmt.Errorf("dns udp listen on %s: %w", addr, err)
+		}
+		go serveDNSUDP(pc, resolverAddr)
+
+		ln, err := ts.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("dns tcp listen on %s: %w", addr, err)
+		}
+		go serveDNSTCP(ln, resolverAddr)
+
+		log.Printf("serving DNS on %s -> %s", addr, resolverAddr)
+	}
+	return nil
+}
+
+// serveDNSUDP forwards each received UDP DNS query to resolverAddr and
+// writes the answer back to the client.
+func serveDNSUDP(pc net.PacketConn, resolverAddr string) {
+	defer pc.Close()
+	for {
+		buf := make([]byte, 4096) // fits EDNS0-advertised sizes
+		n, src, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		go func(query []byte, src net.Addr) {
+			resp, err := forwardDNSUDP(query, resolverAddr)
+			if err != nil {
+				log.Printf("dns udp forward: %v", err)
+				return
+			}
+			if _, err := pc.WriteTo(resp, src); err != nil {
+				log.Printf("dns udp reply: %v", err)
+			}
+		}(buf[:n], src)
+	}
+}
+
+func forwardDNSUDP(query []byte, resolverAddr string) ([]byte, error) {
+	c, err := net.Dial("udp", resolverAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write(query); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, 4096)
+	n, err := c.Read(resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp[:n], nil
+}
+
+// serveDNSTCP proxies DNS-over-TCP connections to resolverAddr. The
+// 2-byte length framing is preserved transparently because we copy the
+// raw stream in both directions.
+func serveDNSTCP(ln net.Listener, resolverAddr string) {
+	defer ln.Close()
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			up, err := net.Dial("tcp", resolverAddr)
+			if err != nil {
+				log.Printf("dns tcp forward: %v", err)
+				return
+			}
+			defer up.Close()
+			done := make(chan struct{}, 2)
+			go func() { io.Copy(up, c); done <- struct{}{} }()
+			go func() { io.Copy(c, up); done <- struct{}{} }()
+			<-done
+		}(c)
+	}
+}
+
+// parseAdvertiseRoutes parses a comma-separated list of CIDRs. Empty or
+// whitespace yields a nil slice and no error.
+func parseAdvertiseRoutes(s string) ([]netip.Prefix, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	var out []netip.Prefix
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %v", part, err)
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
+}
 
 // parseDestinationPgDbs parses the --destination-pg-dbs flag value as
 // a JSON array of upstreamConfig and validates each entry. An empty
