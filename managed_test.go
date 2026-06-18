@@ -204,7 +204,7 @@ func startManagedProxy(t *testing.T, cfg upstreamConfig, caPEM []byte) string {
 	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
 		t.Fatal(err)
 	}
-	p, err := newProxy(cfg.Target, caFile)
+	p, err := newProxy(cfg.Target, caFile, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

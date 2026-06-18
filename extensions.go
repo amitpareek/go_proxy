@@ -42,10 +42,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"tailscale.com/client/local"
+	"tailscale.com/tsnet"
 )
 
 // upstreamConfig describes one named Postgres upstream. The proxy
-// listens on Listen (Fly 6PN) and forwards to
+// listens on Listen (on both Tailscale and Fly 6PN) and forwards to
 // Target. If User and Password are set the entry is "managed": the
 // proxy itself authenticates to the upstream with those credentials
 // and clients connect credential-less (their startup user is
@@ -125,11 +128,12 @@ func parseDestinationPgDbsJSON(raw string) ([]upstreamConfig, error) {
 }
 
 // runProxies parses --destination-pg-dbs, creates one proxy per
-// entry (sharing the upstream CA), starts the Fly 6PN listener for
-// each, registers the dev page on the debug mux, and brings up the
-// HTTP CONNECT proxy. It is tolerant of an empty database list — first
-// launch will commonly have none until secrets are set.
-func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
+// entry (sharing the upstream CA + tsclient), starts the Tailscale
+// and Fly 6PN listeners for each, registers the dev page on the
+// debug mux, and brings up the HTTP CONNECT proxy. It is tolerant of
+// an empty database list — first launch will commonly have none
+// until secrets are set.
+func runProxies(ts *tsnet.Server, tsclient *local.Client, upstreamCAPath string, debugMux *http.ServeMux) {
 	cfgs, err := parseDestinationPgDbs()
 	if err != nil {
 		log.Fatalf("--destination-pg-dbs: %v", err)
@@ -137,12 +141,9 @@ func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
 	if len(cfgs) == 0 {
 		log.Printf("no Postgres databases configured. Set DESTINATION_PG_DBS to a JSON array (see the dev page on the debug port).")
 	}
-	if *flyListenHost == "" {
-		log.Printf("warning: --fly-listen-host is empty, so no Postgres listeners will be started.")
-	}
 
 	for _, u := range cfgs {
-		p, err := newProxy(u.Target, upstreamCAPath)
+		p, err := newProxy(u.Target, upstreamCAPath, tsclient)
 		if err != nil {
 			log.Fatalf("db %q: %v", u.Name, err)
 		}
@@ -151,6 +152,13 @@ func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
 			log.Printf("db %q: managed mode, upstream user %q default db %q", u.Name, u.User, u.DBName)
 		}
 		expvar.Publish("pgproxy_"+u.Name, p.Expvar())
+
+		tsLn, err := ts.Listen("tcp", fmt.Sprintf(":%d", u.Listen))
+		if err != nil {
+			log.Fatalf("tailscale listen for %q on :%d: %v", u.Name, u.Listen, err)
+		}
+		log.Printf("db %q: Tailscale :%d -> %s", u.Name, u.Listen, u.Target)
+		go func(p *proxy, ln net.Listener) { log.Fatal(p.Serve(ln)) }(p, tsLn)
 
 		if *flyListenHost != "" {
 			addr := net.JoinHostPort(strings.Trim(*flyListenHost, "[]"), strconv.Itoa(u.Listen))
@@ -169,7 +177,7 @@ func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
 				http.NotFound(w, r)
 				return
 			}
-			renderDevPage(w, cfgs)
+			renderDevPage(w, ts, cfgs)
 		})
 	}
 
@@ -187,20 +195,29 @@ func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
 }
 
 // renderDevPage writes a small HTML reference page listing the
-// configured databases with their Fly 6PN connection URLs and target
-// host:port. It also documents how to add/modify databases and how to
-// use the HTTP CONNECT proxy. Passwords are never displayed.
-func renderDevPage(w http.ResponseWriter, cfgs []upstreamConfig) {
+// configured databases with their Tailscale and Fly 6PN connection
+// URLs and target host:port. It also documents how to add/modify
+// databases and how to use the HTTP CONNECT proxy. Passwords are
+// never displayed.
+func renderDevPage(w http.ResponseWriter, ts *tsnet.Server, cfgs []upstreamConfig) {
+	tsHost := ts.Hostname
+	if tsclient, err := ts.LocalClient(); err == nil {
+		if st, err := tsclient.Status(context.Background()); err == nil && st != nil && st.Self != nil {
+			if dn := strings.TrimSuffix(st.Self.DNSName, "."); dn != "" {
+				tsHost = dn
+			}
+		}
+	}
 	flyApp := os.Getenv("FLY_APP_NAME")
 	flyHost := "pgproxy.internal"
 	if flyApp != "" {
 		flyHost = flyApp + ".internal"
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(renderDevPageHTML(flyHost, cfgs))
+	w.Write(renderDevPageHTML(tsHost, flyHost, cfgs))
 }
 
-func renderDevPageHTML(flyHost string, cfgs []upstreamConfig) []byte {
+func renderDevPageHTML(tsHost, flyHost string, cfgs []upstreamConfig) []byte {
 	sorted := append([]upstreamConfig(nil), cfgs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Listen < sorted[j].Listen })
 
@@ -239,7 +256,7 @@ th { color: #666; font-weight: normal; width: 8em; }
 .warn { background: #fff5d6; padding: 10px 12px; border-radius: 4px; border: 1px solid #f0d990; }
 </style></head><body>
 <h1>pgproxy</h1>
-<p class="note">Reachable to Fly apps over 6PN (and to the tailnet via a separate Tailscale subnet router).</p>
+<p class="note">Reachable to Fly apps over 6PN and to humans over Tailscale.</p>
 
 <h2>Databases</h2>
 `)
@@ -264,12 +281,14 @@ as a Fly secret to add some — see <em>Configure</em> below.
 					connPath = "/" + u.DBName
 				}
 				fmt.Fprintf(&b, "<tr><th>Fly 6PN</th><td><code>postgres://%s:%d%s</code></td></tr>\n", html.EscapeString(flyHost), u.Listen, html.EscapeString(connPath))
+				fmt.Fprintf(&b, "<tr><th>Tailscale</th><td><code>postgres://%s:%d%s</code></td></tr>\n", html.EscapeString(tsHost), u.Listen, html.EscapeString(connPath))
 				fmt.Fprintf(&b, "<tr><th>Upstream user</th><td><code>%s</code> <span class=\"note\">(injected by the proxy; no client credentials needed)</span></td></tr>\n", html.EscapeString(u.User))
 				if u.DBName != "" {
 					fmt.Fprintf(&b, "<tr><th>Default db</th><td><code>%s</code> <span class=\"note\">(override with any db name in the connection string)</span></td></tr>\n", html.EscapeString(u.DBName))
 				}
 			} else {
 				fmt.Fprintf(&b, "<tr><th>Fly 6PN</th><td><code>%s:%d</code> <span class=\"note\">(client must supply real upstream credentials)</span></td></tr>\n", html.EscapeString(flyHost), u.Listen)
+				fmt.Fprintf(&b, "<tr><th>Tailscale</th><td><code>%s:%d</code></td></tr>\n", html.EscapeString(tsHost), u.Listen)
 			}
 			fmt.Fprintf(&b, "<tr><th>Target</th><td class=\"target\"><code>%s</code></td></tr>\n", html.EscapeString(u.Target))
 			b.WriteString("</table>\n")
@@ -298,13 +317,13 @@ choices: <code>5432</code> for the primary writer, <code>5433</code> for the fir
 read-only, <code>5434</code> and up for additional read replicas. After
 deploying, the entry shows up in <em>Databases</em> above and is
 reachable at <code>` + html.EscapeString(flyHost) + `:&lt;listen&gt;</code> from Fly
-apps (or via a Tailscale subnet router pointed at Fly 6PN).</p>
+apps or <code>` + html.EscapeString(tsHost) + `:&lt;listen&gt;</code> from Tailscale.</p>
 
 <h2>HTTP CONNECT proxy</h2>
 <p>For outbound HTTPS calls that need to come from this app's fixed
 Fly egress IP (e.g. IP-allowlisted vendors), use the binary's HTTPS
 <code>CONNECT</code> forward proxy on <code>` + html.EscapeString(flyHost) + `:8080</code>.
-Access is gated to Fly 6PN; other sources get <code>403</code>.</p>
+Access is gated to Fly 6PN; Tailscale clients get <code>403</code>.</p>
 <pre>curl -x http://` + html.EscapeString(flyHost) + `:8080 https://some-vendor.example.com/</pre>
 
 <h2>application_name attribution</h2>
@@ -313,6 +332,7 @@ the proxy injects one derived from the peer's identity:</p>
 <ul>
 <li>Fly 6PN clients: <code>&lt;region&gt;.&lt;app&gt;</code>
 (derived from PTR + <code>vms.&lt;app&gt;.internal</code> TXT).</li>
+<li>Tailscale clients: your tailnet login (or tag list).</li>
 </ul>
 <p>This shows up in <code>pg_stat_activity.application_name</code> on Neon, so
 you can attribute traffic and spot noisy neighbors.</p>
@@ -328,11 +348,14 @@ type peerKind int
 
 const (
 	peerReject peerKind = iota
+	peerTailscale
 	peerFly
 )
 
 func (k peerKind) String() string {
 	switch k {
+	case peerTailscale:
+		return "tailscale"
 	case peerFly:
 		return "fly"
 	default:
@@ -340,13 +363,14 @@ func (k peerKind) String() string {
 	}
 }
 
-var flyPrefix = netip.MustParsePrefix("fdaa::/16")
+var (
+	flyPrefix   = netip.MustParsePrefix("fdaa::/16")
+	tailscaleV4 = netip.MustParsePrefix("100.64.0.0/10")
+	tailscaleV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+)
 
 // classifyPeer returns the peerKind for a remote address string of
-// the form "host:port" or "[ipv6]:port". Only Fly 6PN sources are
-// accepted; everything else (including traffic relayed in from a
-// Tailscale subnet router, which is SNATed to a 6PN address) is judged
-// by its source IP.
+// the form "host:port" or "[ipv6]:port".
 func classifyPeer(remote string) peerKind {
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {
@@ -357,8 +381,11 @@ func classifyPeer(remote string) peerKind {
 		return peerReject
 	}
 	ip = ip.Unmap()
-	if flyPrefix.Contains(ip) {
+	switch {
+	case flyPrefix.Contains(ip):
 		return peerFly
+	case tailscaleV4.Contains(ip), tailscaleV6.Contains(ip):
+		return peerTailscale
 	}
 	return peerReject
 }
@@ -367,6 +394,30 @@ func classifyPeer(remote string) peerKind {
 // to log plus the application_name to inject.
 func (p *proxy) identifyClient(ctx context.Context, c net.Conn) (user, machine, appName string, err error) {
 	switch classifyPeer(c.RemoteAddr().String()) {
+	case peerTailscale:
+		whois, werr := p.client.WhoIs(ctx, c.RemoteAddr().String())
+		if werr != nil {
+			p.errors.Add("whois-failed", 1)
+			return "", "", "", fmt.Errorf("getting client identity: %v", werr)
+		}
+		if whois.Node != nil {
+			if whois.Node.Hostinfo.ShareeNode() {
+				machine = "external-device"
+			} else {
+				machine = strings.TrimSuffix(whois.Node.Name, ".")
+			}
+		}
+		if whois.UserProfile != nil {
+			user = whois.UserProfile.LoginName
+			if user == "tagged-devices" && whois.Node != nil {
+				user = strings.Join(whois.Node.Tags, ",")
+			}
+		}
+		if user == "" || machine == "" {
+			p.errors.Add("no-ts-identity", 1)
+			return "", "", "", fmt.Errorf("couldn't identify source user and machine (user %q, machine %q)", user, machine)
+		}
+		return user, machine, user, nil
 	case peerFly:
 		host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
 		ip, _ := netip.ParseAddr(host)
