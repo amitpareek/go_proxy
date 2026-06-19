@@ -157,7 +157,9 @@ early during implementation.
   subnet routing, `.internal` over the tailnet, `application_name` attribution, optional
   Tailscale (gated on `TS_AUTHKEY`). Go has no `tailscale.com` import (WhoIs over the raw
   LocalAPI socket). `go build`/`vet`/`test` pass.
-- `fly.toml` still says `app = "pgproxy"` while deployed as `internal-go-proxy` (cosmetic mismatch).
+- `fly.toml` `app` defaults to `private-gateway`, but the **actual app name is set at deploy
+  time** (`fly deploy -a <name>`), so the `app =` value is just a placeholder. Currently
+  deployed as `internal-go-proxy`.
 - **Open item:** `entrypoint.sh`/`fly-router.sh` aren't hardened against a failing
   `tailscale up` crash-looping the container (`set -e`). A past deploy hit a restart loop;
   if it recurs, run `tailscale up` backgrounded with retries and always `exec pgproxy`.

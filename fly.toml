@@ -8,7 +8,7 @@
 #
 # Before first deploy:
 #
-#   fly apps create pgproxy
+#   fly apps create private-gateway
 #   fly secrets set TS_AUTHKEY="tskey-auth-..."        # ephemeral+reusable+tagged; omit for 6PN-only
 #   fly deploy
 #
@@ -26,7 +26,8 @@
 #
 # Secrets (never put these in [env]): TS_AUTHKEY, DESTINATION_PG_DBS.
 
-app = "pgproxy"
+# Default app name; the actual app is set at deploy time (e.g. `fly deploy -a <name>`).
+app = "private-gateway"
 primary_region = "sin"
 
 [build]
