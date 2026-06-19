@@ -222,7 +222,7 @@ func startManagedProxy(t *testing.T, cfg upstreamConfig, caPEM []byte) string {
 			}
 			go func(sid int64, c net.Conn) {
 				defer c.Close()
-				if err := p.serveManaged(context.Background(), sid, c, "fly-test-app"); err != nil {
+				if err := p.serveManaged(context.Background(), sid, c, "fly-test-app", false); err != nil {
 					// Sessions may outlive the test body; never t.Logf here.
 					log.Printf("test proxy: serveManaged: %v", err)
 				}

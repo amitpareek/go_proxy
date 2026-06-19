@@ -400,13 +400,13 @@ func classifyPeer(remote string) peerKind {
 // WhoIs against the local tailscaled (see whoisTailscale). Identity is
 // best-effort: a failed lookup yields a fallback label, never a rejected
 // connection.
-func (p *proxy) identifyClient(ctx context.Context, c net.Conn) (user, machine, appName string, err error) {
+func (p *proxy) identifyClient(ctx context.Context, c net.Conn) (user, machine, appName string, fromTS bool, err error) {
 	switch classifyPeer(c.RemoteAddr().String()) {
 	case peerFly:
 		host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
 		ip, _ := netip.ParseAddr(host)
 		ident := lookupFlyIdent(ctx, ip)
-		return ident, "fly", ident, nil
+		return ident, "fly", ident, false, nil
 	case peerTailscale:
 		login, node := whoisTailscale(ctx, c.RemoteAddr().String())
 		if login == "" {
@@ -416,11 +416,29 @@ func (p *proxy) identifyClient(ctx context.Context, c net.Conn) (user, machine, 
 		if node == "" {
 			node = "tailscale"
 		}
-		return login, node, login, nil
+		return login, node, login, true, nil
 	default:
 		p.errors.Add("disallowed-source", 1)
-		return "", "", "", fmt.Errorf("rejecting connection from disallowed source %s", c.RemoteAddr())
+		return "", "", "", false, fmt.Errorf("rejecting connection from disallowed source %s", c.RemoteAddr())
 	}
+}
+
+// finalAppName decides the application_name sent upstream. For Tailscale
+// clients we always append the tailnet identity, so a human behind a
+// client-set name (e.g. psql) is still attributable — "psql" becomes
+// "psql (amit@example.com)". For other clients we only fill it in when
+// the client left it blank (preserving an app's own name).
+func finalAppName(clientVal, identity string, fromTS bool) string {
+	if identity == "" {
+		return clientVal
+	}
+	if clientVal == "" {
+		return identity
+	}
+	if fromTS {
+		return clientVal + " (" + identity + ")"
+	}
+	return clientVal
 }
 
 // whoisTailscale asks the local tailscaled (over its unix API socket)
@@ -476,10 +494,10 @@ func whoisTailscale(ctx context.Context, remoteAddr string) (login, node string)
 	return login, node
 }
 
-// forwardStartup reads the Postgres StartupMessage from the client
-// side, injects application_name (if absent) using injectAppName,
-// and writes the rewritten message to upstream.
-func (p *proxy) forwardStartup(clientConn io.Reader, upstream io.Writer, injectAppName string, prefix []byte, hadPrefix bool) error {
+// forwardStartup reads the Postgres StartupMessage from the client side,
+// sets application_name via finalAppName (fill-if-blank, or append the
+// tailnet identity for Tailscale clients), and writes it to upstream.
+func (p *proxy) forwardStartup(clientConn io.Reader, upstream io.Writer, injectAppName string, prefix []byte, hadPrefix, fromTS bool) error {
 	var raw []byte
 	var err error
 	if hadPrefix {
@@ -491,7 +509,7 @@ func (p *proxy) forwardStartup(clientConn io.Reader, upstream io.Writer, injectA
 		p.errors.Add("bad-startup", 1)
 		return fmt.Errorf("reading client startup: %v", err)
 	}
-	out, err := rewriteStartup(raw, injectAppName)
+	out, err := rewriteStartup(raw, injectAppName, fromTS)
 	if err != nil {
 		p.errors.Add("bad-startup", 1)
 		return fmt.Errorf("rewriting client startup: %v", err)
@@ -532,7 +550,7 @@ func readStartupMessageWithPrefix(r io.Reader, prefix []byte) ([]byte, error) {
 
 const pgProtoV3 = uint32(0x00030000)
 
-func rewriteStartup(raw []byte, injectAppName string) ([]byte, error) {
+func rewriteStartup(raw []byte, injectAppName string, fromTS bool) ([]byte, error) {
 	if len(raw) < 8 {
 		return nil, fmt.Errorf("startup too short: %d", len(raw))
 	}
@@ -545,7 +563,7 @@ func rewriteStartup(raw []byte, injectAppName string) ([]byte, error) {
 		return raw, nil
 	}
 	if injectAppName == "" {
-		return raw, nil
+		return raw, nil // no identity to set or append
 	}
 	if length < 9 || raw[length-1] != 0 {
 		return nil, fmt.Errorf("startup not null-terminated")
@@ -571,13 +589,26 @@ func rewriteStartup(raw []byte, injectAppName string) ([]byte, error) {
 		keys = append(keys, key)
 		vals = append(vals, val)
 	}
-	for _, k := range keys {
+
+	// Compute the desired application_name and replace/append/skip.
+	idx := -1
+	existing := ""
+	for i, k := range keys {
 		if k == "application_name" {
-			return raw, nil
+			idx, existing = i, vals[i]
+			break
 		}
 	}
-	keys = append(keys, "application_name")
-	vals = append(vals, injectAppName)
+	newVal := finalAppName(existing, injectAppName, fromTS)
+	switch {
+	case idx >= 0 && newVal == existing:
+		return raw, nil // present and unchanged
+	case idx >= 0:
+		vals[idx] = newVal // replace (TS append case)
+	default:
+		keys = append(keys, "application_name")
+		vals = append(vals, newVal)
+	}
 
 	var out bytes.Buffer
 	out.Grow(length + len("application_name") + len(injectAppName) + 8)

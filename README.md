@@ -83,12 +83,15 @@ upstream itself.
 The proxy stamps `application_name` so you can attribute traffic in
 `pg_stat_activity`:
 
-- **Fly 6PN clients** → `<region>.<app>` (reverse PTR + `vms.<app>.internal` TXT).
+- **Fly 6PN clients** → `<region>.<app>` (reverse PTR + `vms.<app>.internal` TXT),
+  only when the client didn't set its own `application_name`.
 - **Tailscale clients** → their tailnet login (or tags), resolved via the local
-  `tailscaled` socket. This is why `FLY_DNS_EXCLUDE_SELF` forces tailnet users onto
-  the Tailscale name: that path preserves their real source IP so they can be
-  identified (the `.internal` path is SNAT'd and would attribute everyone to the
-  router).
+  `tailscaled` socket, and **always appended** to whatever the client sent — so a
+  human on `psql` shows up as `psql (amit@example.com)`, never just `psql`. (If the
+  client sent nothing, it's just the login.) This is why `FLY_DNS_EXCLUDE_SELF`
+  forces tailnet users onto the Tailscale name: that path preserves their real
+  source IP so WhoIs can identify them (the `.internal` path is SNAT'd and would
+  attribute everyone to the router).
 
 ## Runtime requirements
 

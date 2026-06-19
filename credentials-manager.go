@@ -37,7 +37,7 @@ import (
 // configured credentials (pgconn speaks SCRAM/md5/cleartext), replays
 // the resulting session state to the client, and then splices bytes
 // like the passthrough path.
-func (p *proxy) serveManaged(ctx context.Context, sessionID int64, c net.Conn, injectAppName string) error {
+func (p *proxy) serveManaged(ctx context.Context, sessionID int64, c net.Conn, injectAppName string, fromTS bool) error {
 	var buf [8]byte
 	if _, err := io.ReadFull(c, buf[:]); err != nil {
 		p.errors.Add("network-error", 1)
@@ -79,10 +79,7 @@ func (p *proxy) serveManaged(ctx context.Context, sessionID int64, c net.Conn, i
 		return fmt.Errorf("parsing client startup: %v", err)
 	}
 	db := chooseDatabase(params["user"], params["database"], p.cfg.DBName)
-	appName := params["application_name"]
-	if appName == "" {
-		appName = injectAppName
-	}
+	appName := finalAppName(params["application_name"], injectAppName, fromTS)
 
 	cfg, err := pgconn.ParseConfig("postgres://" + p.upstreamAddr + "/?sslmode=disable")
 	if err != nil {

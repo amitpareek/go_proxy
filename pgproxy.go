@@ -164,8 +164,9 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// EXT BEGIN: peer classification + identity (Fly 6PN PTR/TXT).
-	user, machine, injectAppName, err := p.identifyClient(ctx, c)
+	// EXT BEGIN: peer classification + identity (Fly 6PN PTR/TXT, or
+	// Tailscale WhoIs). fromTS drives application_name appending below.
+	user, machine, injectAppName, fromTS, err := p.identifyClient(ctx, c)
 	if err != nil {
 		return err
 	}
@@ -181,7 +182,7 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	// EXT BEGIN: managed upstreams authenticate to the upstream with
 	// configured credentials; everything below is the passthrough path.
 	if p.cfg.managed() {
-		return p.serveManaged(ctx, sessionID, c, injectAppName)
+		return p.serveManaged(ctx, sessionID, c, injectAppName, fromTS)
 	}
 	// EXT END
 
@@ -262,11 +263,11 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 		// The 8 bytes we already read in `buf` are the first 8 bytes
 		// of the plaintext StartupMessage; reuse them.
 		buf2 := buf // copy onto the stack for the prefix slice
-		if err := p.forwardStartup(clientConn, uptc, injectAppName, buf2[:], true); err != nil {
+		if err := p.forwardStartup(clientConn, uptc, injectAppName, buf2[:], true, fromTS); err != nil {
 			return err
 		}
 	} else {
-		if err := p.forwardStartup(clientConn, uptc, injectAppName, nil, false); err != nil {
+		if err := p.forwardStartup(clientConn, uptc, injectAppName, nil, false, fromTS); err != nil {
 			return err
 		}
 	}

@@ -124,10 +124,14 @@ early during implementation.
   for pgproxy's own `*.internal` names, so tailnet users connect to pgproxy at its Tailscale
   IP (real source preserved), and `whoisTailscale` resolves that to the login/tags via the
   local `tailscaled` socket. Fly 6PN apps still get `<region>.<app>` via PTR/TXT.
-  - This is a **soft** nudge (DNS only): someone with pgproxy's raw 6PN address could still
-    reach it through the subnet route, bypassing attribution. It's chosen over a hard
-    `ip6tables` block because the block is fragile across multiple HA routers, while DNS
-    exclusion is uniform fleet-wide.
+  - **Tailscale identity is *appended*, not just filled in** (`finalAppName`). Clients like
+    `psql` always send their own `application_name`, so to keep the human attributable we
+    append the login: `psql` → `psql (amit@example.com)`. For non-Tailscale clients we only
+    fill `application_name` when it's blank (preserving an app's own name).
+  - The DNS self-exclude is a **soft** nudge (DNS only): someone with pgproxy's raw 6PN
+    address could still reach it through the subnet route, bypassing attribution. It's chosen
+    over a hard `ip6tables` block because the block is fragile across multiple HA routers,
+    while DNS exclusion is uniform fleet-wide.
 - Reference implementation: [fly-apps/tailscale-router](https://github.com/fly-apps/tailscale-router).
 
 ## Status

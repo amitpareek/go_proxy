@@ -62,7 +62,7 @@ func parseStartupKV(t *testing.T, raw []byte) map[string]string {
 
 func TestRewriteStartup_InjectsWhenAbsent(t *testing.T) {
 	in := buildStartup("user", "alice", "database", "mydb")
-	out, err := rewriteStartup(in, "myapp")
+	out, err := rewriteStartup(in, "myapp", false)
 	if err != nil {
 		t.Fatalf("rewriteStartup: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestRewriteStartup_InjectsWhenAbsent(t *testing.T) {
 
 func TestRewriteStartup_PreservesExisting(t *testing.T) {
 	in := buildStartup("user", "alice", "application_name", "client-set")
-	out, err := rewriteStartup(in, "myapp")
+	out, err := rewriteStartup(in, "myapp", false)
 	if err != nil {
 		t.Fatalf("rewriteStartup: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestRewriteStartup_PassthroughNonV3(t *testing.T) {
 	binary.BigEndian.PutUint32(raw[4:8], 80877102)
 	binary.BigEndian.PutUint32(raw[8:12], 12345)
 	binary.BigEndian.PutUint32(raw[12:16], 67890)
-	out, err := rewriteStartup(raw[:], "myapp")
+	out, err := rewriteStartup(raw[:], "myapp", false)
 	if err != nil {
 		t.Fatalf("rewriteStartup: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestRewriteStartup_PassthroughNonV3(t *testing.T) {
 
 func TestRewriteStartup_EmptyInjectIsNoop(t *testing.T) {
 	in := buildStartup("user", "alice")
-	out, err := rewriteStartup(in, "")
+	out, err := rewriteStartup(in, "", false)
 	if err != nil {
 		t.Fatalf("rewriteStartup: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestRewriteStartup_RejectsMalformed(t *testing.T) {
 	bad := make([]byte, 20)
 	binary.BigEndian.PutUint32(bad[:4], 50)
 	binary.BigEndian.PutUint32(bad[4:8], pgProtoV3)
-	if _, err := rewriteStartup(bad, "myapp"); err == nil {
+	if _, err := rewriteStartup(bad, "myapp", false); err == nil {
 		t.Errorf("expected error for length mismatch")
 	}
 
@@ -132,7 +132,7 @@ func TestRewriteStartup_RejectsMalformed(t *testing.T) {
 	binary.BigEndian.PutUint32(noTerm[:4], 16)
 	binary.BigEndian.PutUint32(noTerm[4:8], pgProtoV3)
 	copy(noTerm[8:], []byte("user\x00xyz"))
-	if _, err := rewriteStartup(noTerm, "myapp"); err == nil {
+	if _, err := rewriteStartup(noTerm, "myapp", false); err == nil {
 		t.Errorf("expected error for missing terminator")
 	}
 }
@@ -194,6 +194,52 @@ func TestClassifyPeer(t *testing.T) {
 	for _, c := range cases {
 		if got := classifyPeer(c.addr); got != c.want {
 			t.Errorf("classifyPeer(%q) = %v, want %v", c.addr, got, c.want)
+		}
+	}
+}
+
+func TestRewriteStartup_TailscaleAppendsToClientName(t *testing.T) {
+	in := buildStartup("user", "alice", "application_name", "psql")
+	out, err := rewriteStartup(in, "amit@example.com", true) // fromTS
+	if err != nil {
+		t.Fatalf("rewriteStartup: %v", err)
+	}
+	kv := parseStartupKV(t, out)
+	if kv["application_name"] != "psql (amit@example.com)" {
+		t.Errorf("application_name = %q, want %q", kv["application_name"], "psql (amit@example.com)")
+	}
+	if kv["user"] != "alice" {
+		t.Errorf("user lost: %v", kv)
+	}
+}
+
+func TestRewriteStartup_TailscaleInjectsWhenAbsent(t *testing.T) {
+	in := buildStartup("user", "alice")
+	out, err := rewriteStartup(in, "amit@example.com", true)
+	if err != nil {
+		t.Fatalf("rewriteStartup: %v", err)
+	}
+	if kv := parseStartupKV(t, out); kv["application_name"] != "amit@example.com" {
+		t.Errorf("application_name = %q, want %q", kv["application_name"], "amit@example.com")
+	}
+}
+
+func TestFinalAppName(t *testing.T) {
+	cases := []struct {
+		client, id string
+		ts         bool
+		want       string
+	}{
+		{"psql", "amit", true, "psql (amit)"}, // TS: append
+		{"psql", "amit", false, "psql"},       // non-TS: preserve client value
+		{"", "amit", true, "amit"},            // absent: use identity
+		{"", "amit", false, "amit"},           // absent: Fly inject
+		{"psql", "", true, "psql"},            // no identity: unchanged
+		{"", "", true, ""},                    // nothing to set
+	}
+	for _, c := range cases {
+		if got := finalAppName(c.client, c.id, c.ts); got != c.want {
+			t.Errorf("finalAppName(%q,%q,%v) = %q, want %q", c.client, c.id, c.ts, got, c.want)
 		}
 	}
 }
