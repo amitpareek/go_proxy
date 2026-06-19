@@ -41,12 +41,14 @@ primary_region = "sin"
   # TS_ADVERTISE_ROUTES    = ""              # default: auto-derive org /48 from fly-local-6pn; or "fdaa::/16"
   # TS_ADVERTISE_EXIT_NODE = "true"          # every machine usable as a region-specific exit node
   # FLY_DNS_RESOLVER       = "[fdaa::3]:53"  # Fly internal resolver; empty disables .internal forwarding
+  # FLY_DNS_EXCLUDE_SELF   = "true"          # NXDOMAIN this app's own *.internal so tailnet users use the Tailscale name (for identity)
   #
   # --- Advanced (defaults are fine) ---
   # TS_ACCEPT_DNS          = "false"         # keep the node on Fly's resolver
   # TS_ACCEPT_ROUTES       = "false"         # a router needn't consume other routes
   # TS_SNAT_SUBNET_ROUTES  = "true"          # required so forwarded traffic gets replies
   # TS_STATE_DIR           = "/tmp/tailscale"# tmpfs = ephemeral; re-auths each restart
+  # TS_SOCKET              = "/var/run/tailscale/tailscaled.sock"  # tailscaled API socket (WhoIs)
   # TS_CONTROL_URL         = ""              # set for self-hosted Headscale
   # TS_EXTRA_ARGS          = ""              # extra `tailscale up` flags
   # UPSTREAM_CA_FILE       = "/etc/ssl/certs/ca-certificates.crt"

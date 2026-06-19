@@ -185,8 +185,8 @@ func TestClassifyPeer(t *testing.T) {
 		want peerKind
 	}{
 		{"[fdaa:0:1:2::3]:5432", peerFly},
-		{"100.64.1.2:5432", peerReject},          // tailscale CGNAT — no longer accepted
-		{"[fd7a:115c:a1e0::1]:5432", peerReject}, // tailscale ULA — no longer accepted
+		{"100.64.1.2:5432", peerTailscale},          // tailscale CGNAT
+		{"[fd7a:115c:a1e0::1]:5432", peerTailscale}, // tailscale ULA
 		{"192.0.2.1:5432", peerReject},
 		{"[2001:db8::1]:5432", peerReject},
 		{"garbage", peerReject},

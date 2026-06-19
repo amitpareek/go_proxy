@@ -267,3 +267,70 @@ func TestDevPage_NeverRendersPasswords(t *testing.T) {
 		t.Errorf("dev page should label entry modes")
 	}
 }
+
+// buildDNSQuery builds a minimal AAAA query for name (id 0x1234, RD set).
+func buildDNSQuery(name string) []byte {
+	var b bytes.Buffer
+	b.Write([]byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+		b.WriteByte(byte(len(label)))
+		b.WriteString(label)
+	}
+	b.WriteByte(0)
+	b.Write([]byte{0x00, 0x1c, 0x00, 0x01}) // QTYPE=AAAA, QCLASS=IN
+	return b.Bytes()
+}
+
+func TestDNSQuestionNameAndExclude(t *testing.T) {
+	dnsExcludeSuffix = "pgproxy.internal"
+	defer func() { dnsExcludeSuffix = "" }()
+	cases := []struct {
+		q    string
+		want bool
+	}{
+		{"pgproxy.internal", true},
+		{"sin.pgproxy.internal", true},
+		{"148e21.vm.pgproxy.internal", true},
+		{"PGPROXY.INTERNAL", true}, // case-insensitive
+		{"other-app.internal", false},
+		{"notpgproxy.internal", false}, // suffix must be on a label boundary
+	}
+	for _, c := range cases {
+		name, ok := dnsQuestionName(buildDNSQuery(c.q))
+		if !ok {
+			t.Fatalf("dnsQuestionName(%q) failed to parse", c.q)
+		}
+		if got := dnsExcluded(name); got != c.want {
+			t.Errorf("dnsExcluded(%q) = %v, want %v (parsed %q)", c.q, got, c.want, name)
+		}
+	}
+}
+
+func TestDNSNXDOMAIN(t *testing.T) {
+	resp := dnsNXDOMAIN(buildDNSQuery("pgproxy.internal"))
+	if resp == nil {
+		t.Fatal("dnsNXDOMAIN returned nil")
+	}
+	if resp[0] != 0x12 || resp[1] != 0x34 {
+		t.Errorf("query ID not echoed")
+	}
+	if resp[2]&0x80 == 0 {
+		t.Errorf("QR bit not set")
+	}
+	if resp[3]&0x0f != 3 {
+		t.Errorf("RCODE = %d, want 3 (NXDOMAIN)", resp[3]&0x0f)
+	}
+	if binary.BigEndian.Uint16(resp[4:6]) != 1 || binary.BigEndian.Uint16(resp[6:8]) != 0 {
+		t.Errorf("QDCOUNT/ANCOUNT = %d/%d, want 1/0", binary.BigEndian.Uint16(resp[4:6]), binary.BigEndian.Uint16(resp[6:8]))
+	}
+	if name, ok := dnsQuestionName(resp); !ok || name != "pgproxy.internal" {
+		t.Errorf("question not echoed: %q (ok=%v)", name, ok)
+	}
+}
+
+func TestDNSExcludedDisabledByDefault(t *testing.T) {
+	dnsExcludeSuffix = ""
+	if dnsExcluded("pgproxy.internal") {
+		t.Errorf("exclusion should be off when dnsExcludeSuffix is empty")
+	}
+}

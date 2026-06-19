@@ -12,22 +12,25 @@
 //   - runProxies: the bootstrap that wires the per-DB listeners, the dev
 //     page, the HTTP CONNECT proxy, and the DNS forwarder
 //   - the dev / reference page (renderDevPage*)
-//   - source gating (classifyPeer) + application_name attribution
-//     (identifyClient + Fly PTR/TXT lookups + StartupMessage rewriting)
+//   - source gating (classifyPeer) + application_name attribution:
+//     Fly 6PN clients by PTR/TXT, Tailscale clients by WhoIs against the
+//     local tailscaled socket (whoisTailscale, raw LocalAPI — no
+//     tailscale.com import), plus StartupMessage rewriting to inject it
 //   - the *.internal DNS forwarder — the Go companion to fly-router.sh
 //     (which runs the tailscaled subnet router); together they are the
 //     "fly-router" feature that makes .internal reachable over Tailscale.
+//     With --fly-dns-exclude-self it returns NXDOMAIN for this app's own
+//     names so tailnet users reach pgproxy by its Tailscale name (which
+//     preserves their identity for application_name).
 //
 // Added flags:
 //
-//	--destination-pg-dbs  JSON array of {name, listen, target} databases
-//	                      this proxy fronts. Empty allowed.
-//	--fly-listen-host     Host (no port) for Fly 6PN listeners.
-//	                      Default "[::]". Empty disables Fly listeners.
-//	--http-proxy-listen   Listen addr for the HTTPS CONNECT proxy.
-//	                      Default "[::]:8080". Empty disables.
-//	--fly-dns-resolver    Upstream Fly resolver for *.internal queries.
-//	                      Default via env "[fdaa::3]:53". Empty disables.
+//	--destination-pg-dbs    JSON array of {name, listen, target} databases.
+//	--fly-listen-host       Host for Fly 6PN listeners. Default "[::]".
+//	--http-proxy-listen     HTTPS CONNECT proxy addr. Default "[::]:8080".
+//	--fly-dns-resolver      Upstream Fly resolver for *.internal. Empty off.
+//	--fly-dns-exclude-self  NXDOMAIN this app's own *.internal names.
+//	--tailscaled-socket     Local tailscaled API socket for WhoIs.
 package main
 
 import (
@@ -44,6 +47,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -76,6 +80,7 @@ var (
 	destinationPgDbs = flag.String("destination-pg-dbs", "", `JSON array of {"name","listen","target"} entries. Empty is allowed.`)
 	flyListenHost    = flag.String("fly-listen-host", "[::]", "Host (no port) to bind Fly 6PN listeners on. Empty disables Fly listeners.")
 	httpProxyListen  = flag.String("http-proxy-listen", "[::]:8080", "Kernel TCP listen address for the HTTPS CONNECT forward proxy. Empty disables.")
+	tailscaledSocket = flag.String("tailscaled-socket", "/var/run/tailscale/tailscaled.sock", "Path to the local tailscaled API socket, used to WhoIs Tailscale clients for application_name. No-op if absent.")
 )
 
 // parseDestinationPgDbs parses the --destination-pg-dbs flag value as
@@ -341,24 +346,35 @@ type peerKind int
 const (
 	peerReject peerKind = iota
 	peerFly
+	peerTailscale
 )
 
 func (k peerKind) String() string {
 	switch k {
 	case peerFly:
 		return "fly"
+	case peerTailscale:
+		return "tailscale"
 	default:
 		return "reject"
 	}
 }
 
-var flyPrefix = netip.MustParsePrefix("fdaa::/16")
+var (
+	flyPrefix   = netip.MustParsePrefix("fdaa::/16")
+	tailscaleV4 = netip.MustParsePrefix("100.64.0.0/10")
+	tailscaleV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+)
 
-// classifyPeer returns the peerKind for a remote address string of
-// the form "host:port" or "[ipv6]:port". Only Fly 6PN sources are
-// accepted; everything else (including traffic relayed in from a
-// Tailscale subnet router, which is SNATed to a 6PN address) is judged
-// by its source IP.
+// classifyPeer returns the peerKind for a remote address string of the
+// form "host:port" or "[ipv6]:port". Fly 6PN sources and direct
+// Tailscale sources are recognized; everything else is rejected.
+//
+// Note on attribution: traffic arriving through the subnet router from
+// the tailnet is SNATed to a 6PN address, so it classifies as peerFly.
+// To be identified as a specific Tailscale user, a client must reach
+// pgproxy at its Tailscale IP directly (which is why FLY_DNS_EXCLUDE_SELF
+// removes pgproxy's own *.internal names — see startFlyDNS).
 func classifyPeer(remote string) peerKind {
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {
@@ -369,14 +385,21 @@ func classifyPeer(remote string) peerKind {
 		return peerReject
 	}
 	ip = ip.Unmap()
-	if flyPrefix.Contains(ip) {
+	switch {
+	case flyPrefix.Contains(ip):
 		return peerFly
+	case tailscaleV4.Contains(ip), tailscaleV6.Contains(ip):
+		return peerTailscale
 	}
 	return peerReject
 }
 
-// identifyClient resolves the peer identity and returns the strings
-// to log plus the application_name to inject.
+// identifyClient resolves the peer identity and returns the strings to
+// log plus the application_name to inject. Fly 6PN clients are named by
+// reverse lookup (<region>.<app>); direct Tailscale clients are named by
+// WhoIs against the local tailscaled (see whoisTailscale). Identity is
+// best-effort: a failed lookup yields a fallback label, never a rejected
+// connection.
 func (p *proxy) identifyClient(ctx context.Context, c net.Conn) (user, machine, appName string, err error) {
 	switch classifyPeer(c.RemoteAddr().String()) {
 	case peerFly:
@@ -384,10 +407,73 @@ func (p *proxy) identifyClient(ctx context.Context, c net.Conn) (user, machine, 
 		ip, _ := netip.ParseAddr(host)
 		ident := lookupFlyIdent(ctx, ip)
 		return ident, "fly", ident, nil
+	case peerTailscale:
+		login, node := whoisTailscale(ctx, c.RemoteAddr().String())
+		if login == "" {
+			p.errors.Add("whois-failed", 1)
+			login = "tailscale-unknown"
+		}
+		if node == "" {
+			node = "tailscale"
+		}
+		return login, node, login, nil
 	default:
 		p.errors.Add("disallowed-source", 1)
 		return "", "", "", fmt.Errorf("rejecting connection from disallowed source %s", c.RemoteAddr())
 	}
+}
+
+// whoisTailscale asks the local tailscaled (over its unix API socket)
+// who owns remoteAddr, returning the login name (or comma-joined tags)
+// and the node name. It speaks the LocalAPI directly over plain HTTP so
+// the binary keeps no tailscale.com dependency. Best-effort: any error
+// yields empty strings.
+func whoisTailscale(ctx context.Context, remoteAddr string) (login, node string) {
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", *tailscaledSocket)
+		},
+	}}
+	cctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, "GET",
+		"http://local-tailscaled.sock/localapi/v0/whois?addr="+url.QueryEscape(remoteAddr), nil)
+	if err != nil {
+		return "", ""
+	}
+	req.Host = "local-tailscaled.sock"
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", ""
+	}
+	// Decode only the fields we need from the LocalAPI WhoIs response.
+	var raw struct {
+		Node *struct {
+			Name string   `json:"Name"`
+			Tags []string `json:"Tags"`
+		} `json:"Node"`
+		UserProfile *struct {
+			LoginName string `json:"LoginName"`
+		} `json:"UserProfile"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return "", ""
+	}
+	if raw.UserProfile != nil {
+		login = raw.UserProfile.LoginName
+	}
+	if raw.Node != nil {
+		node = strings.TrimSuffix(raw.Node.Name, ".")
+		if login == "tagged-devices" && len(raw.Node.Tags) > 0 {
+			login = strings.Join(raw.Node.Tags, ",")
+		}
+	}
+	return login, node
 }
 
 // forwardStartup reads the Postgres StartupMessage from the client
@@ -619,8 +705,16 @@ func parseVmsTXT(txts []string) map[string]string {
 // queries aimed at the node's Tailscale IP are received.
 const dnsListen = "[::]:53"
 
-var flyDNSResolver = flag.String("fly-dns-resolver", "",
-	`Upstream Fly internal DNS resolver (e.g. "[fdaa::3]:53") to forward *.internal queries to. Served on `+dnsListen+` (UDP+TCP). Empty disables the forwarder.`)
+var (
+	flyDNSResolver = flag.String("fly-dns-resolver", "",
+		`Upstream Fly internal DNS resolver (e.g. "[fdaa::3]:53") to forward *.internal queries to. Served on `+dnsListen+` (UDP+TCP). Empty disables the forwarder.`)
+	flyDNSExcludeSelf = flag.Bool("fly-dns-exclude-self", false,
+		"Return NXDOMAIN for this app's own *.internal names, so tailnet users reach pgproxy by its Tailscale name (preserving their identity for application_name). No effect on other apps' names or on Fly 6PN clients.")
+)
+
+// dnsExcludeSuffix is "<FLY_APP_NAME>.internal" when self-exclusion is
+// active, else empty. Set once in startFlyDNS.
+var dnsExcludeSuffix string
 
 // startFlyDNS launches the DNS forwarder if --fly-dns-resolver is set.
 // It is a no-op otherwise. Listener errors are fatal (a misconfigured
@@ -629,6 +723,13 @@ func startFlyDNS() {
 	resolver := strings.TrimSpace(*flyDNSResolver)
 	if resolver == "" {
 		return
+	}
+
+	if *flyDNSExcludeSelf {
+		if app := strings.TrimSpace(os.Getenv("FLY_APP_NAME")); app != "" {
+			dnsExcludeSuffix = strings.ToLower(app) + ".internal"
+			log.Printf("dns: self-exclude on — NXDOMAIN for %s (tailnet reaches pgproxy by its Tailscale name)", dnsExcludeSuffix)
+		}
 	}
 
 	pc, err := net.ListenPacket("udp", dnsListen)
@@ -646,8 +747,78 @@ func startFlyDNS() {
 	log.Printf("serving .internal DNS on %s -> %s", dnsListen, resolver)
 }
 
-// serveDNSUDP forwards each received UDP DNS query to resolverAddr and
-// writes the answer back to the client.
+// dnsExcluded reports whether name (lowercased, no trailing dot) is one
+// of this app's own *.internal names: the bare <app>.internal, or any
+// label under it (covers <region>.<app>.internal and <id>.vm.<app>.internal).
+func dnsExcluded(name string) bool {
+	if dnsExcludeSuffix == "" {
+		return false
+	}
+	return name == dnsExcludeSuffix || strings.HasSuffix(name, "."+dnsExcludeSuffix)
+}
+
+// dnsQuestionName parses the first question's QNAME from a DNS message,
+// returning it lowercased without a trailing dot. ok is false if the
+// message is malformed.
+func dnsQuestionName(msg []byte) (name string, ok bool) {
+	if len(msg) < 12 || binary.BigEndian.Uint16(msg[4:6]) < 1 {
+		return "", false
+	}
+	var sb strings.Builder
+	off := 12
+	for {
+		if off >= len(msg) {
+			return "", false
+		}
+		l := int(msg[off])
+		off++
+		if l == 0 {
+			break
+		}
+		if l&0xC0 != 0 || off+l > len(msg) { // questions carry no compression pointers
+			return "", false
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('.')
+		}
+		sb.Write(msg[off : off+l])
+		off += l
+	}
+	return strings.ToLower(sb.String()), true
+}
+
+// dnsNXDOMAIN builds an NXDOMAIN response echoing query's ID + question.
+// Returns nil if the question can't be located.
+func dnsNXDOMAIN(query []byte) []byte {
+	off := 12
+	for off < len(query) {
+		l := int(query[off])
+		if l == 0 {
+			off++
+			break
+		}
+		if l&0xC0 != 0 {
+			return nil
+		}
+		off += 1 + l
+	}
+	off += 4 // QTYPE + QCLASS
+	if off < 16 || off > len(query) {
+		return nil
+	}
+	resp := make([]byte, off)
+	copy(resp, query[:off])
+	resp[2] = 0x80 | (query[2] & 0x01)         // QR=1, preserve RD
+	resp[3] = 0x80 | 0x03                      // RA=1, RCODE=NXDOMAIN(3)
+	binary.BigEndian.PutUint16(resp[4:6], 1)   // QDCOUNT
+	binary.BigEndian.PutUint16(resp[6:8], 0)   // ANCOUNT
+	binary.BigEndian.PutUint16(resp[8:10], 0)  // NSCOUNT
+	binary.BigEndian.PutUint16(resp[10:12], 0) // ARCOUNT
+	return resp
+}
+
+// serveDNSUDP answers each UDP query: NXDOMAIN for excluded self names,
+// otherwise forwarded to resolverAddr.
 func serveDNSUDP(pc net.PacketConn, resolverAddr string) {
 	defer pc.Close()
 	for {
@@ -657,6 +828,12 @@ func serveDNSUDP(pc net.PacketConn, resolverAddr string) {
 			return
 		}
 		go func(query []byte, src net.Addr) {
+			if name, ok := dnsQuestionName(query); ok && dnsExcluded(name) {
+				if resp := dnsNXDOMAIN(query); resp != nil {
+					pc.WriteTo(resp, src)
+					return
+				}
+			}
 			resp, err := forwardDNSUDP(query, resolverAddr)
 			if err != nil {
 				log.Printf("dns udp forward: %v", err)
@@ -687,9 +864,8 @@ func forwardDNSUDP(query []byte, resolverAddr string) ([]byte, error) {
 	return resp[:n], nil
 }
 
-// serveDNSTCP proxies DNS-over-TCP connections to resolverAddr. The
-// 2-byte length framing is preserved transparently because we copy the
-// raw stream in both directions.
+// serveDNSTCP answers DNS-over-TCP, applying the same self-exclusion as
+// UDP. Messages are length-prefixed (RFC 1035 §4.2.2).
 func serveDNSTCP(ln net.Listener, resolverAddr string) {
 	defer ln.Close()
 	for {
@@ -697,18 +873,68 @@ func serveDNSTCP(ln net.Listener, resolverAddr string) {
 		if err != nil {
 			return
 		}
-		go func(c net.Conn) {
-			defer c.Close()
-			up, err := net.Dial("tcp", resolverAddr)
-			if err != nil {
-				log.Printf("dns tcp forward: %v", err)
-				return
-			}
-			defer up.Close()
-			done := make(chan struct{}, 2)
-			go func() { io.Copy(up, c); done <- struct{}{} }()
-			go func() { io.Copy(c, up); done <- struct{}{} }()
-			<-done
-		}(c)
+		go handleDNSTCP(c, resolverAddr)
 	}
+}
+
+func handleDNSTCP(c net.Conn, resolverAddr string) {
+	defer c.Close()
+	for {
+		_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+		msg, err := readDNSTCP(c)
+		if err != nil {
+			return
+		}
+		if name, ok := dnsQuestionName(msg); ok && dnsExcluded(name) {
+			if resp := dnsNXDOMAIN(msg); resp != nil {
+				if writeDNSTCP(c, resp) != nil {
+					return
+				}
+				continue
+			}
+		}
+		resp, err := forwardDNSTCP(msg, resolverAddr)
+		if err != nil {
+			log.Printf("dns tcp forward: %v", err)
+			return
+		}
+		if writeDNSTCP(c, resp) != nil {
+			return
+		}
+	}
+}
+
+func readDNSTCP(r io.Reader) ([]byte, error) {
+	var ln [2]byte
+	if _, err := io.ReadFull(r, ln[:]); err != nil {
+		return nil, err
+	}
+	msg := make([]byte, binary.BigEndian.Uint16(ln[:]))
+	if _, err := io.ReadFull(r, msg); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+func writeDNSTCP(w io.Writer, msg []byte) error {
+	var ln [2]byte
+	binary.BigEndian.PutUint16(ln[:], uint16(len(msg)))
+	if _, err := w.Write(ln[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(msg)
+	return err
+}
+
+func forwardDNSTCP(msg []byte, resolverAddr string) ([]byte, error) {
+	c, err := net.Dial("tcp", resolverAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := writeDNSTCP(c, msg); err != nil {
+		return nil, err
+	}
+	return readDNSTCP(c)
 }
