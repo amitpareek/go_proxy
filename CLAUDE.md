@@ -24,7 +24,7 @@ Fly egress IP) plus a small dev/reference page. It's a fork kept close to upstre
   - `pgproxy.go`              — the **pure Postgres wire proxy** (strict upstream TLS, serve loop). Upstream-faithful; keep diff-minimal, hooks marked `// EXT`.
   - `credentials-manager.go` — **credential management** ("managed" mode): the proxy logs in to the upstream itself so clients connect credential-less; also the shared StartupMessage read/detect helpers.
   - `httpproxy.go`           — the **HTTPS `CONNECT` forward proxy** (outbound via the fixed Fly egress IP).
-  - `fly.go`                 — **all Fly glue**: multi-DB config, `runProxies` bootstrap, dev page, source gating (`classifyPeer`), `application_name` attribution (Fly PTR/TXT **and** Tailscale WhoIs via the local socket), `.internal` DNS forwarder + self-exclusion (Go companion to `fly-router.sh`).
+  - `fly.go`                 — **all Fly glue**: multi-DB config, `runProxies` bootstrap, dev page, source gating (`classifyPeer` — auto-trusts Fly 6PN when `onFly`, Tailscale ranges when `--tailscale-enabled`), `application_name` attribution (Fly PTR/TXT **and** Tailscale WhoIs via the local socket; identity *appended* to a client-set name), and the `.internal` DNS forwarder including the self→Tailscale-IP rewrite (Go companion to `fly-router.sh`).
 - **Tailscale / fly-router (shell/Docker, NOT Go):**
   - `fly-router.sh` + Dockerfile install lines — all `tailscaled` / `tailscale up` logic
     (the Fly subnet-router setup; modeled on `fly-apps/tailscale-router`).
@@ -37,11 +37,16 @@ via **raw HTTP** (no `tailscale.com` import) for best-effort WhoIs. All Tailscal
 
 ## Architecture status
 
-**"Approach B" is implemented on branch `approach-b`** (this branch): a real `tailscaled`
-subnet router + exit node alongside a 6PN-only Go proxy, with the file layout above. `main`
-still holds the older **tsnet-embedded** design (commit `d0858c9`) until this is merged.
-Runtime (TUN / `ip_forward`) is **not yet deploy-verified** on Fly. `project.md` is the
-source of truth for the design and config.
+**Shipped and running on Fly** (app `internal-go-proxy`; remote
+`github.com/amitpareek/private-gateway`). The current design — "Approach B" — is a real
+`tailscaled` (TUN) subnet router + exit node alongside the 6PN-only Go proxy, all merged to
+`main`. Tailscale is **optional**: it comes up only when `TS_AUTHKEY` is set; otherwise
+pgproxy is a plain Fly 6PN proxy. Auto-detection (no toggles): `onFly` = `FLY_APP_NAME`
+present; Tailscale-on = `TS_AUTHKEY` present (surfaced to the binary as `--tailscale-enabled`,
+with the secret unset before exec). `project.md` is the source of truth for design + config.
+
+Known open item: `entrypoint.sh`/`fly-router.sh` aren't hardened against a failing
+`tailscale up` crash-looping the container (`set -e`); harden if a restart loop recurs.
 
 ## Conventions
 

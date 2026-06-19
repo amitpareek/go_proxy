@@ -152,11 +152,12 @@ early during implementation.
 
 ## Status
 
-- `main` @ `d0858c9` — tsnet-based (pre-migration).
-- Branch `approach-b` — Approach B implemented: Go has no `tailscale.com` import
-  (WhoIs uses the raw LocalAPI socket); `fly.go` holds the `.internal` DNS forwarder with
-  auto self-rewrite (own `*.internal` → Tailscale IP) + Tailscale WhoIs attribution; `fly-router.sh` + orchestrator
-  `entrypoint.sh` + Dockerfile install tailscale. `go build`/`vet`/`test` pass; shell
-  syntax checked.
-- Next — deploy-verify on Fly (TUN + `ip_forward`; and that the `tailscaled` LocalAPI WhoIs
-  works over the socket), then merge to `main`.
+- **Shipped on `main` and running on Fly** (app `internal-go-proxy`; remote
+  `github.com/amitpareek/private-gateway`, renamed from `go_proxy`). Verified end-to-end:
+  subnet routing, `.internal` over the tailnet, `application_name` attribution, optional
+  Tailscale (gated on `TS_AUTHKEY`). Go has no `tailscale.com` import (WhoIs over the raw
+  LocalAPI socket). `go build`/`vet`/`test` pass.
+- `fly.toml` still says `app = "pgproxy"` while deployed as `internal-go-proxy` (cosmetic mismatch).
+- **Open item:** `entrypoint.sh`/`fly-router.sh` aren't hardened against a failing
+  `tailscale up` crash-looping the container (`set -e`). A past deploy hit a restart loop;
+  if it recurs, run `tailscale up` backgrounded with retries and always `exec pgproxy`.
