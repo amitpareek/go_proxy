@@ -26,6 +26,6 @@ exec /pgproxy \
   --upstream-ca-file="${UPSTREAM_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}" \
   --fly-listen-host="${FLY_LISTEN_HOST:-[::]}" \
   --http-proxy-listen="${HTTP_PROXY_LISTEN:-[::]:8080}" \
-  --fly-dns-resolver="${FLY_DNS_RESOLVER-[fdaa::3]:53}" \
+  --dns-resolver="${DNS_RESOLVER:-}" \
   --tailscaled-socket="${TS_SOCKET:-/var/run/tailscale/tailscaled.sock}" \
   --destination-pg-dbs="${DESTINATION_PG_DBS:-}"

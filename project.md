@@ -49,7 +49,7 @@ target's 6PN listener.
 | `pgproxy.go` | Pure Postgres wire proxy: strict upstream TLS + serve loop. Upstream-faithful; customizations are `// EXT` hooks. |
 | `credentials-manager.go` | Credential management ("managed" mode): the proxy authenticates to the upstream itself so clients connect credential-less. Also the shared StartupMessage read/detect helpers. |
 | `httpproxy.go` | HTTPS `CONNECT` forward proxy (outbound via the fixed Fly egress IP). |
-| `fly.go` | All Fly glue: multi-DB config, `runProxies` bootstrap, dev page, source gating (`classifyPeer`), `application_name` attribution (Fly PTR/TXT + Tailscale WhoIs over the local socket + StartupMessage rewrite), and the `.internal` DNS forwarder with self-exclusion (Go companion to `fly-router.sh`). |
+| `fly.go` | All Fly glue: multi-DB config, `runProxies` bootstrap, dev page, source gating (`classifyPeer`, auto-trusts Tailscale always + Fly 6PN when `onFly`), `application_name` attribution (Fly PTR/TXT + Tailscale WhoIs over the local socket + StartupMessage rewrite), and the `.internal` DNS forwarder with the self → Tailscale-IP rewrite (Go companion to `fly-router.sh`). |
 
 **fly-router / Tailscale layer — shell/Docker (no Go):**
 
@@ -81,7 +81,7 @@ default chosen for how we run today. Set non-secrets in `fly.toml [env]`, secret
 | `TS_HOSTNAME` | `$FLY_MACHINE_ID-$FLY_REGION-$FLY_APP_NAME` | Machine ID makes every ephemeral node uniquely named, avoiding MagicDNS `-1/-2` collisions across restarts/regions. |
 | `TS_ADVERTISE_ROUTES` | auto-derive org `/48` from `fly-local-6pn` | Advertise exactly the reachable 6PN range, not the whole `fdaa::/16`. |
 | `TS_ADVERTISE_EXIT_NODE` | `true` | We want every machine usable as a region-specific egress exit node. |
-| `FLY_DNS_RESOLVER` | `[fdaa::3]:53` | `fdaa::3` is Fly's internal resolver; forwarding `.internal` there is what makes Fly names resolve over the tailnet. |
+| `DNS_RESOLVER` | `[fdaa::3]:53` on Fly, else empty | Upstream resolver the forwarder relays `*.internal` to. Auto-defaults to Fly's `fdaa::3` when on Fly (no config); generic name so another provider can point it at theirs; empty disables. |
 
 ### Advanced (defaults are fine; rarely touched)
 
@@ -102,10 +102,14 @@ default chosen for how we run today. Set non-secrets in `fly.toml [env]`, secret
 Fly injects `FLY_APP_NAME`, `FLY_REGION`, `FLY_MACHINE_ID`, `FLY_PRIVATE_IP` automatically —
 do not set these.
 
-**No env var:** the DNS *self-rewrite* (answer this app's own `*.internal` with the node's
-Tailscale IP) is **auto-enabled** whenever `FLY_APP_NAME` is present (i.e. on Fly) and the
-forwarder is running. Inert off-Fly; falls back to plain forwarding until a Tailscale IP
-exists. See Decisions.
+**No env var (auto-detected via `FLY_APP_NAME` = "on Fly"):**
+- **Trusted sources** (`classifyPeer`): Tailscale ranges are *always* accepted (they're
+  Tailscale-exclusive, so harmless when unused); Fly 6PN (`fdaa::/16`) is accepted *only on
+  Fly*. So off-Fly the tailnet is the access path — nothing to configure.
+- **`DNS_RESOLVER`** defaults to Fly's `[fdaa::3]:53` on Fly, empty (forwarder off) elsewhere.
+- **DNS self-rewrite** (answer own `*.internal` with the node's Tailscale IP) is on whenever
+  `FLY_APP_NAME` is present and the forwarder is running. Falls back to plain forwarding until
+  a Tailscale IP exists. See Decisions.
 
 ## Deployment (one-time Tailscale setup)
 

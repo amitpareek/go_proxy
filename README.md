@@ -56,7 +56,7 @@ var only to change it. Non-secrets go in `fly.toml [env]`; secrets via
 |---|---|---|---|
 | **Subnet route** | `TS_ADVERTISE_ROUTES` | auto-derive org `/48` | from `fly-local-6pn`; or set a CIDR, or empty to disable |
 | **Exit node** | `TS_ADVERTISE_EXIT_NODE` | `true` | each machine is a region-specific exit node |
-| **`.internal` DNS** | `FLY_DNS_RESOLVER` | `[fdaa::3]:53` | forwards `*.internal` to Fly's resolver; empty disables |
+| **`.internal` DNS** | `DNS_RESOLVER` | `[fdaa::3]:53` on Fly, off elsewhere | forwards `*.internal` to this resolver; auto-set on Fly, set explicitly on other providers, empty disables |
 | **DNS self → Tailscale** | _(automatic)_ | on when `FLY_APP_NAME` is set | Answers *this app's* own `*.internal` with the node's **Tailscale IP**, so tailnet clients reach pgproxy directly over Tailscale (identifiable). Auto-detected on Fly; no env var. See Identity. |
 | **Hostname** | `TS_HOSTNAME` | `<machineid>-<region>-<app>` | e.g. `148e21-sin-pgproxy`. Dashes, not dots — Tailscale MagicDNS converts dots to dashes anyway. The machine id keeps every ephemeral node uniquely named. |
 

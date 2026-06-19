@@ -180,6 +180,9 @@ func TestParseVmsTXT(t *testing.T) {
 }
 
 func TestClassifyPeer(t *testing.T) {
+	// On Fly: 6PN is trusted, Tailscale always trusted.
+	defer func(prev bool) { onFly = prev }(onFly)
+	onFly = true
 	cases := []struct {
 		addr string
 		want peerKind
@@ -195,6 +198,18 @@ func TestClassifyPeer(t *testing.T) {
 		if got := classifyPeer(c.addr); got != c.want {
 			t.Errorf("classifyPeer(%q) = %v, want %v", c.addr, got, c.want)
 		}
+	}
+}
+
+func TestClassifyPeer_OffFlyRejects6PN(t *testing.T) {
+	// Off Fly, the 6PN range is NOT trusted; Tailscale still is.
+	defer func(prev bool) { onFly = prev }(onFly)
+	onFly = false
+	if got := classifyPeer("[fdaa:0:1:2::3]:5432"); got != peerReject {
+		t.Errorf("off-Fly fdaa = %v, want reject", got)
+	}
+	if got := classifyPeer("100.64.1.2:5432"); got != peerTailscale {
+		t.Errorf("off-Fly tailscale = %v, want tailscale", got)
 	}
 }
 

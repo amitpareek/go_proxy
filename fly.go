@@ -28,7 +28,7 @@
 //	--destination-pg-dbs   JSON array of {name, listen, target} databases.
 //	--fly-listen-host      Host for Fly 6PN listeners. Default "[::]".
 //	--http-proxy-listen    HTTPS CONNECT proxy addr. Default "[::]:8080".
-//	--fly-dns-resolver     Upstream Fly resolver for *.internal. Empty off.
+//	--dns-resolver         Upstream resolver for *.internal. Fly default; off elsewhere.
 //	--tailscaled-socket    Local tailscaled API socket for WhoIs.
 package main
 
@@ -199,7 +199,7 @@ func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
 
 	// EXT: serve *.internal DNS for tailnet clients (forwarder defined
 	// below). The real tailscaled subnet route is set up in fly-router.sh.
-	startFlyDNS()
+	startDNSForwarder()
 }
 
 // renderDevPage writes a small HTML reference page listing the
@@ -365,15 +365,24 @@ var (
 	tailscaleV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 )
 
+// onFly reports whether we're running on Fly (the platform injects
+// FLY_APP_NAME). Used to auto-enable Fly-specific behavior — trusting the
+// 6PN source range, the .internal DNS forwarder default, the self-rewrite
+// — without any toggle. It's a var so tests can override it.
+var onFly = os.Getenv("FLY_APP_NAME") != ""
+
 // classifyPeer returns the peerKind for a remote address string of the
-// form "host:port" or "[ipv6]:port". Fly 6PN sources and direct
-// Tailscale sources are recognized; everything else is rejected.
+// form "host:port" or "[ipv6]:port". Trusted sources are auto-detected:
+// Tailscale ranges are always accepted (they're Tailscale-exclusive, so
+// trusting them is harmless when Tailscale isn't in use), and Fly 6PN
+// (fdaa::/16) is accepted only when running on Fly. Everything else is
+// rejected — so off Fly, the tailnet is the access path.
 //
 // Note on attribution: traffic forwarded through the subnet router from
 // the tailnet is SNATed to a 6PN address, so it classifies as peerFly.
 // To be identified as a specific Tailscale user, a client must reach
 // pgproxy at its Tailscale IP directly — which is why the forwarder
-// answers pgproxy's own *.internal names with our Tailscale IP (see startFlyDNS).
+// answers pgproxy's own *.internal names with our Tailscale IP.
 func classifyPeer(remote string) peerKind {
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {
@@ -385,7 +394,7 @@ func classifyPeer(remote string) peerKind {
 	}
 	ip = ip.Unmap()
 	switch {
-	case flyPrefix.Contains(ip):
+	case onFly && flyPrefix.Contains(ip):
 		return peerFly
 	case tailscaleV4.Contains(ip), tailscaleV6.Contains(ip):
 		return peerTailscale
@@ -721,9 +730,9 @@ func parseVmsTXT(txts []string) map[string]string {
 // ─── .internal DNS forwarder (Go companion to fly-router.sh) ─────────────
 //
 // A tiny DNS forwarder that answers on [::]:53 (UDP+TCP). For most names
-// it relays the query verbatim to Fly's internal resolver
-// (--fly-dns-resolver, default [fdaa::3]:53), so tailnet clients resolve
-// *.internal to 6PN addresses reachable via the subnet route.
+// it relays the query verbatim to --dns-resolver (which defaults to Fly's
+// internal resolver [fdaa::3]:53 on Fly, off elsewhere), so tailnet
+// clients resolve *.internal to 6PN addresses reachable via the subnet route.
 //
 // Special case ("Option I", auto-enabled on Fly via FLY_APP_NAME): for
 // THIS app's own *.internal names, instead of returning the 6PN address it answers
@@ -744,18 +753,25 @@ const (
 	dnsTypeAAAA = 28
 )
 
-var flyDNSResolver = flag.String("fly-dns-resolver", "",
-	`Upstream Fly internal DNS resolver (e.g. "[fdaa::3]:53") to forward *.internal queries to. Served on `+dnsListen+` (UDP+TCP). Empty disables the forwarder.`)
+// flyResolver is Fly's internal DNS resolver — the default --dns-resolver
+// when running on Fly.
+const flyResolver = "[fdaa::3]:53"
+
+var dnsResolver = flag.String("dns-resolver", "",
+	`Upstream DNS resolver to forward *.internal queries to, served on `+dnsListen+` (UDP+TCP). Defaults to `+flyResolver+` on Fly; empty (off) elsewhere.`)
 
 // dnsSelfSuffix is "<FLY_APP_NAME>.internal" when we can self-rewrite,
-// else empty. Set once in startFlyDNS.
+// else empty. Set once in startDNSForwarder.
 var dnsSelfSuffix string
 
-// startFlyDNS launches the DNS forwarder if --fly-dns-resolver is set.
-// It is a no-op otherwise. Listener errors are fatal (a misconfigured
-// :53 bind should fail loudly at startup, not silently).
-func startFlyDNS() {
-	resolver := strings.TrimSpace(*flyDNSResolver)
+// startDNSForwarder launches the DNS forwarder if a resolver is set (or
+// defaulted on Fly). It is a no-op otherwise. Listener errors are fatal
+// (a misconfigured :53 bind should fail loudly at startup, not silently).
+func startDNSForwarder() {
+	resolver := strings.TrimSpace(*dnsResolver)
+	if resolver == "" && onFly {
+		resolver = flyResolver // hardcoded Fly default; generic name lets others override
+	}
 	if resolver == "" {
 		return
 	}
