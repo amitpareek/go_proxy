@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -281,9 +282,9 @@ func buildDNSQuery(name string) []byte {
 	return b.Bytes()
 }
 
-func TestDNSQuestionNameAndExclude(t *testing.T) {
-	dnsExcludeSuffix = "pgproxy.internal"
-	defer func() { dnsExcludeSuffix = "" }()
+func TestParseDNSQuestionAndIsSelf(t *testing.T) {
+	dnsSelfSuffix = "pgproxy.internal"
+	defer func() { dnsSelfSuffix = "" }()
 	cases := []struct {
 		q    string
 		want bool
@@ -296,20 +297,29 @@ func TestDNSQuestionNameAndExclude(t *testing.T) {
 		{"notpgproxy.internal", false}, // suffix must be on a label boundary
 	}
 	for _, c := range cases {
-		name, ok := dnsQuestionName(buildDNSQuery(c.q))
+		name, qtype, qend, ok := parseDNSQuestion(buildDNSQuery(c.q))
 		if !ok {
-			t.Fatalf("dnsQuestionName(%q) failed to parse", c.q)
+			t.Fatalf("parseDNSQuestion(%q) failed to parse", c.q)
 		}
-		if got := dnsExcluded(name); got != c.want {
-			t.Errorf("dnsExcluded(%q) = %v, want %v (parsed %q)", c.q, got, c.want, name)
+		if qtype != dnsTypeAAAA {
+			t.Errorf("%q: qtype = %d, want %d", c.q, qtype, dnsTypeAAAA)
+		}
+		if qend < 12 {
+			t.Errorf("%q: qend = %d, want >= 12", c.q, qend)
+		}
+		if got := dnsIsSelf(name); got != c.want {
+			t.Errorf("dnsIsSelf(%q) = %v, want %v (parsed %q)", c.q, got, c.want, name)
 		}
 	}
 }
 
-func TestDNSNXDOMAIN(t *testing.T) {
-	resp := dnsNXDOMAIN(buildDNSQuery("pgproxy.internal"))
+func TestDNSAnswer(t *testing.T) {
+	q := buildDNSQuery("pgproxy.internal") // AAAA
+	_, qtype, qend, _ := parseDNSQuestion(q)
+	ts := netip.MustParseAddr("fd7a:115c:a1e0::1234")
+	resp := dnsAnswer(q, qtype, ts, qend)
 	if resp == nil {
-		t.Fatal("dnsNXDOMAIN returned nil")
+		t.Fatal("dnsAnswer returned nil")
 	}
 	if resp[0] != 0x12 || resp[1] != 0x34 {
 		t.Errorf("query ID not echoed")
@@ -317,20 +327,32 @@ func TestDNSNXDOMAIN(t *testing.T) {
 	if resp[2]&0x80 == 0 {
 		t.Errorf("QR bit not set")
 	}
-	if resp[3]&0x0f != 3 {
-		t.Errorf("RCODE = %d, want 3 (NXDOMAIN)", resp[3]&0x0f)
+	if resp[3]&0x0f != 0 {
+		t.Errorf("RCODE = %d, want 0 (NOERROR)", resp[3]&0x0f)
 	}
-	if binary.BigEndian.Uint16(resp[4:6]) != 1 || binary.BigEndian.Uint16(resp[6:8]) != 0 {
-		t.Errorf("QDCOUNT/ANCOUNT = %d/%d, want 1/0", binary.BigEndian.Uint16(resp[4:6]), binary.BigEndian.Uint16(resp[6:8]))
+	if binary.BigEndian.Uint16(resp[6:8]) != 1 {
+		t.Errorf("ANCOUNT = %d, want 1", binary.BigEndian.Uint16(resp[6:8]))
 	}
-	if name, ok := dnsQuestionName(resp); !ok || name != "pgproxy.internal" {
-		t.Errorf("question not echoed: %q (ok=%v)", name, ok)
+	// answer: name ptr (0xC00C) + type + class + ttl(4) + rdlen(2) + 16-byte AAAA
+	ans := resp[qend:]
+	if len(ans) != 2+2+2+4+2+16 {
+		t.Fatalf("answer length = %d, want %d", len(ans), 2+2+2+4+2+16)
+	}
+	if ans[0] != 0xC0 || ans[1] != 0x0C {
+		t.Errorf("answer name not a compression pointer to the question")
+	}
+	if got := binary.BigEndian.Uint16(ans[2:4]); got != dnsTypeAAAA {
+		t.Errorf("answer type = %d, want AAAA(%d)", got, dnsTypeAAAA)
+	}
+	rdata := ans[12:]
+	if got, _ := netip.AddrFromSlice(rdata); got != ts {
+		t.Errorf("answer rdata = %v, want %v", got, ts)
 	}
 }
 
-func TestDNSExcludedDisabledByDefault(t *testing.T) {
-	dnsExcludeSuffix = ""
-	if dnsExcluded("pgproxy.internal") {
-		t.Errorf("exclusion should be off when dnsExcludeSuffix is empty")
+func TestDNSIsSelfDisabledByDefault(t *testing.T) {
+	dnsSelfSuffix = ""
+	if dnsIsSelf("pgproxy.internal") {
+		t.Errorf("self-match should be off when dnsSelfSuffix is empty")
 	}
 }

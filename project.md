@@ -82,7 +82,7 @@ default chosen for how we run today. Set non-secrets in `fly.toml [env]`, secret
 | `TS_ADVERTISE_ROUTES` | auto-derive org `/48` from `fly-local-6pn` | Advertise exactly the reachable 6PN range, not the whole `fdaa::/16`. |
 | `TS_ADVERTISE_EXIT_NODE` | `true` | We want every machine usable as a region-specific egress exit node. |
 | `FLY_DNS_RESOLVER` | `[fdaa::3]:53` | `fdaa::3` is Fly's internal resolver; forwarding `.internal` there is what makes Fly names resolve over the tailnet. |
-| `FLY_DNS_EXCLUDE_SELF` | `true` | Return NXDOMAIN for this app's own `*.internal` names so tailnet users reach pgproxy by its Tailscale name — the path that preserves their identity for `application_name`. Inert without `FLY_APP_NAME`. |
+| `FLY_DNS_SELF_TO_TAILSCALE` | `true` | Answer this app's own `*.internal` names with the node's **Tailscale IP** (not its 6PN address), so tailnet clients reach pgproxy directly over Tailscale — preserving their real source IP for `application_name` identity, on every port. Inert without `FLY_APP_NAME`. |
 
 ### Advanced (defaults are fine; rarely touched)
 
@@ -117,21 +117,25 @@ early during implementation.
 
 ## Decisions / scope (current)
 
-- **Per-user attribution: tailnet users connect by Tailscale name.** Subnet routing SNATs
-  the source to the router's 6PN address, so a tailnet user reaching `pgproxy.internal` would
-  be attributed only at the router level. To get a real per-user `application_name`, we
-  **force the identifiable path**: `FLY_DNS_EXCLUDE_SELF` makes the forwarder return NXDOMAIN
-  for pgproxy's own `*.internal` names, so tailnet users connect to pgproxy at its Tailscale
-  IP (real source preserved), and `whoisTailscale` resolves that to the login/tags via the
-  local `tailscaled` socket. Fly 6PN apps still get `<region>.<app>` via PTR/TXT.
+- **Per-user attribution via DNS self-rewrite ("Option I").** A tailnet user reaching
+  `pgproxy.internal` over the *subnet route* would be attributed only at the router level
+  (multi-machine forwarding SNATs the source to the router's 6PN address). To get a real
+  per-user `application_name`, the forwarder answers pgproxy's *own* `*.internal` names with
+  the node's **Tailscale IP** (`FLY_DNS_SELF_TO_TAILSCALE`, `dnsSelfAnswer`). The tailnet
+  client then connects **directly to pgproxy over Tailscale** — no subnet route, no SNAT — so
+  its real source IP is preserved and `whoisTailscale` resolves the login/tags via the local
+  `tailscaled` socket. Works on every port (Postgres, dev page, CONNECT), topology-independent.
+  Fly 6PN apps are unaffected — they query Fly's resolver, not us, and still get the 6PN address.
   - **Tailscale identity is *appended*, not just filled in** (`finalAppName`). Clients like
     `psql` always send their own `application_name`, so to keep the human attributable we
     append the login: `psql` → `psql (amit@example.com)`. For non-Tailscale clients we only
     fill `application_name` when it's blank (preserving an app's own name).
-  - The DNS self-exclude is a **soft** nudge (DNS only): someone with pgproxy's raw 6PN
-    address could still reach it through the subnet route, bypassing attribution. It's chosen
-    over a hard `ip6tables` block because the block is fragile across multiple HA routers,
-    while DNS exclusion is uniform fleet-wide.
+  - Single-machine note: even via the 6PN/subnet path, a tailnet user hitting the router's
+    *own* 6PN address is delivered locally (no SNAT) and is already identifiable — the
+    self-rewrite makes this deterministic and adds the multi-machine + all-ports guarantees.
+  - Considered alternatives: a port-specific `ip6tables` block (single-machine only, leaky
+    across HA routers) and a Tailscale ACL (clean but requires tailnet policy edits). The DNS
+    self-rewrite keeps everything in the app and needs no tailnet config.
 - Reference implementation: [fly-apps/tailscale-router](https://github.com/fly-apps/tailscale-router).
 
 ## Status
@@ -139,7 +143,7 @@ early during implementation.
 - `main` @ `d0858c9` — tsnet-based (pre-migration).
 - Branch `approach-b` — Approach B implemented: Go has no `tailscale.com` import
   (WhoIs uses the raw LocalAPI socket); `fly.go` holds the `.internal` DNS forwarder with
-  `FLY_DNS_EXCLUDE_SELF` + Tailscale WhoIs attribution; `fly-router.sh` + orchestrator
+  `FLY_DNS_SELF_TO_TAILSCALE` self-rewrite + Tailscale WhoIs attribution; `fly-router.sh` + orchestrator
   `entrypoint.sh` + Dockerfile install tailscale. `go build`/`vet`/`test` pass; shell
   syntax checked.
 - Next — deploy-verify on Fly (TUN + `ip_forward`; and that the `tailscaled` LocalAPI WhoIs

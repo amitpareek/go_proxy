@@ -27,6 +27,6 @@ exec /pgproxy \
   --fly-listen-host="${FLY_LISTEN_HOST:-[::]}" \
   --http-proxy-listen="${HTTP_PROXY_LISTEN:-[::]:8080}" \
   --fly-dns-resolver="${FLY_DNS_RESOLVER-[fdaa::3]:53}" \
-  --fly-dns-exclude-self="${FLY_DNS_EXCLUDE_SELF:-true}" \
+  --fly-dns-self-to-tailscale="${FLY_DNS_SELF_TO_TAILSCALE:-true}" \
   --tailscaled-socket="${TS_SOCKET:-/var/run/tailscale/tailscaled.sock}" \
   --destination-pg-dbs="${DESTINATION_PG_DBS:-}"
