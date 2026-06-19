@@ -1,19 +1,20 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// flydns.go is the Fly internal-DNS bridge: a tiny forwarder that
-// answers DNS on [::]:53 (UDP+TCP) and relays every query verbatim to
-// Fly's internal resolver (--fly-dns-resolver, default [fdaa::3]:53).
+// fly-router.go is the Go half of the fly-router feature (its shell half
+// is fly-router.sh): a tiny DNS forwarder that answers on [::]:53
+// (UDP+TCP) and relays every query verbatim to Fly's internal resolver
+// (--fly-dns-resolver, default [fdaa::3]:53).
 //
 // It exists so tailnet clients can resolve *.internal names: Tailscale
 // split DNS sends the "internal" search domain to this node's Tailscale
 // IP, the query lands here, Fly's resolver answers with the 6PN AAAA,
-// and the real tailscaled subnet route (configured in tailscale-up.sh,
-// not here) carries the connection. DNS messages are opaque to us — we
-// just shuttle bytes — so no DNS library is needed.
+// and the real tailscaled subnet route (configured in fly-router.sh, not
+// here) carries the connection. DNS messages are opaque to us — we just
+// shuttle bytes — so no DNS library is needed.
 //
-// This is a Fly concern (it talks to Fly's resolver); all *Tailscale*
-// configuration lives in the shell/Docker layer, never in Go.
+// This is plain Go talking to Fly's resolver — there is no Tailscale
+// dependency here; all Tailscale configuration lives in fly-router.sh.
 package main
 
 import (

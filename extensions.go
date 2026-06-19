@@ -185,8 +185,8 @@ func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
 		go func() { log.Fatal(srv.Serve(ln)) }()
 	}
 
-	// EXT: serve *.internal DNS for tailnet clients (see flydns.go). The
-	// real tailscaled subnet route is configured in tailscale-up.sh.
+	// EXT: serve *.internal DNS for tailnet clients (see fly-router.go).
+	// The real tailscaled subnet route is configured in fly-router.sh.
 	startFlyDNS()
 }
 

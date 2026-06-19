@@ -18,7 +18,7 @@
 #   2. the Linux kernel FORWARDS packets between the Tailscale interface
 #      and Fly 6PN (ip_forward).
 # A tailnet client then resolves <app>.internal (via Tailscale split DNS →
-# the pgproxy DNS forwarder, see flydns.go) and routes the connection
+# the pgproxy DNS forwarder, see fly-router.go) and routes the connection
 # through this machine to the 6PN target.
 #
 # Why a REAL tailscaled (TUN), not userspace/tsnet:

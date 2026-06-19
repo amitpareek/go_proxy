@@ -25,7 +25,7 @@ Fly egress IP) plus a small dev/reference page. It's a fork kept close to upstre
   - `extensions.go`— Fly 6PN bits: dev page, `classifyPeer`, `application_name` (Fly PTR/TXT).
   - `httpproxy.go` — HTTPS `CONNECT` forward proxy.
   - `managed.go`   — managed credential injection.
-  - `flydns.go`    — `.internal` DNS forwarder → Fly resolver (`fdaa::3`).
+  - `fly-router.go`— `.internal` DNS forwarder → Fly resolver (`fdaa::3`); Go half of the fly-router feature.
 - **Tailscale / fly-router (shell/Docker, NOT Go):**
   - `fly-router.sh` + Dockerfile install lines — all `tailscaled` / `tailscale up` logic
     (the Fly subnet-router setup; modeled on `fly-apps/tailscale-router`).
