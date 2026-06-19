@@ -19,18 +19,17 @@
 //   - the *.internal DNS forwarder — the Go companion to fly-router.sh
 //     (which runs the tailscaled subnet router); together they are the
 //     "fly-router" feature that makes .internal reachable over Tailscale.
-//     With --fly-dns-self-to-tailscale it answers this app's own *.internal
-//     names with the node's Tailscale IP, so tailnet clients reach pgproxy
-//     directly over Tailscale (identifiable for application_name).
+//     It auto-answers this app's own *.internal names (detected via
+//     FLY_APP_NAME) with the node's Tailscale IP, so tailnet clients reach
+//     pgproxy directly over Tailscale (identifiable for application_name).
 //
 // Added flags:
 //
-//	--destination-pg-dbs        JSON array of {name, listen, target} databases.
-//	--fly-listen-host           Host for Fly 6PN listeners. Default "[::]".
-//	--http-proxy-listen         HTTPS CONNECT proxy addr. Default "[::]:8080".
-//	--fly-dns-resolver          Upstream Fly resolver for *.internal. Empty off.
-//	--fly-dns-self-to-tailscale Answer own *.internal with our Tailscale IP.
-//	--tailscaled-socket         Local tailscaled API socket for WhoIs.
+//	--destination-pg-dbs   JSON array of {name, listen, target} databases.
+//	--fly-listen-host      Host for Fly 6PN listeners. Default "[::]".
+//	--http-proxy-listen    HTTPS CONNECT proxy addr. Default "[::]:8080".
+//	--fly-dns-resolver     Upstream Fly resolver for *.internal. Empty off.
+//	--tailscaled-socket    Local tailscaled API socket for WhoIs.
 package main
 
 import (
@@ -373,7 +372,7 @@ var (
 // Note on attribution: traffic forwarded through the subnet router from
 // the tailnet is SNATed to a 6PN address, so it classifies as peerFly.
 // To be identified as a specific Tailscale user, a client must reach
-// pgproxy at its Tailscale IP directly — which is why FLY_DNS_SELF_TO_TAILSCALE
+// pgproxy at its Tailscale IP directly — which is why the forwarder
 // answers pgproxy's own *.internal names with our Tailscale IP (see startFlyDNS).
 func classifyPeer(remote string) peerKind {
 	host, _, err := net.SplitHostPort(remote)
@@ -726,8 +725,8 @@ func parseVmsTXT(txts []string) map[string]string {
 // (--fly-dns-resolver, default [fdaa::3]:53), so tailnet clients resolve
 // *.internal to 6PN addresses reachable via the subnet route.
 //
-// Special case (--fly-dns-self-to-tailscale, "Option I"): for THIS app's
-// own *.internal names, instead of returning the 6PN address it answers
+// Special case ("Option I", auto-enabled on Fly via FLY_APP_NAME): for
+// THIS app's own *.internal names, instead of returning the 6PN address it answers
 // with this node's *Tailscale* IP. Tailnet clients then reach pgproxy
 // directly over Tailscale on every port — no subnet route, no SNAT — so
 // their real source IP is preserved and WhoIs can attribute them. Fly
@@ -745,15 +744,11 @@ const (
 	dnsTypeAAAA = 28
 )
 
-var (
-	flyDNSResolver = flag.String("fly-dns-resolver", "",
-		`Upstream Fly internal DNS resolver (e.g. "[fdaa::3]:53") to forward *.internal queries to. Served on `+dnsListen+` (UDP+TCP). Empty disables the forwarder.`)
-	flyDNSSelfToTailscale = flag.Bool("fly-dns-self-to-tailscale", false,
-		"Answer this app's own *.internal names with this node's Tailscale IP (instead of its 6PN address), so tailnet clients reach pgproxy directly over Tailscale and stay identifiable. No effect on other apps' names or on Fly 6PN clients.")
-)
+var flyDNSResolver = flag.String("fly-dns-resolver", "",
+	`Upstream Fly internal DNS resolver (e.g. "[fdaa::3]:53") to forward *.internal queries to. Served on `+dnsListen+` (UDP+TCP). Empty disables the forwarder.`)
 
-// dnsSelfSuffix is "<FLY_APP_NAME>.internal" when self-to-tailscale is
-// active, else empty. Set once in startFlyDNS.
+// dnsSelfSuffix is "<FLY_APP_NAME>.internal" when we can self-rewrite,
+// else empty. Set once in startFlyDNS.
 var dnsSelfSuffix string
 
 // startFlyDNS launches the DNS forwarder if --fly-dns-resolver is set.
@@ -765,11 +760,13 @@ func startFlyDNS() {
 		return
 	}
 
-	if *flyDNSSelfToTailscale {
-		if app := strings.TrimSpace(os.Getenv("FLY_APP_NAME")); app != "" {
-			dnsSelfSuffix = strings.ToLower(app) + ".internal"
-			log.Printf("dns: answering %s with this node's Tailscale IP (tailnet reaches pgproxy directly over Tailscale)", dnsSelfSuffix)
-		}
+	// Auto-detect: on Fly we know our own app name (FLY_APP_NAME is
+	// injected), so answer our own *.internal with our Tailscale IP. Off
+	// Fly (no FLY_APP_NAME) this stays empty and we just forward; before
+	// tailscaled assigns an IP, selfTailscaleAddr falls back to forwarding.
+	if app := strings.TrimSpace(os.Getenv("FLY_APP_NAME")); app != "" {
+		dnsSelfSuffix = strings.ToLower(app) + ".internal"
+		log.Printf("dns: answering %s with this node's Tailscale IP (tailnet reaches pgproxy directly over Tailscale)", dnsSelfSuffix)
 	}
 
 	pc, err := net.ListenPacket("udp", dnsListen)
