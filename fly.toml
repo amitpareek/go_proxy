@@ -32,29 +32,13 @@ primary_region = "sin"
   dockerfile = "Dockerfile"
 
 [env]
-  # Zero-config: only TS_AUTHKEY (secret) is required. The defaults below
-  # are what we run today — uncomment only to override. Rationale for each
-  # default is in project.md.
+  # Zero-config: the only required setting is TS_AUTHKEY (a secret — set via
+  # `fly secrets set`, not here). Every other knob has a default in
+  # fly-router.sh / the binary; the full list with rationale is in project.md.
+  # Set a var here only to override a default, e.g.:
   #
-  # --- Common ---
-  # TS_HOSTNAME            = "..."           # default: $FLY_MACHINE_ID-$FLY_REGION-$FLY_APP_NAME
-  # TS_ADVERTISE_ROUTES    = ""              # default: auto-derive org /48 from fly-local-6pn; or "fdaa::/16"
-  # TS_ADVERTISE_EXIT_NODE = "true"          # every machine usable as a region-specific exit node
-  # FLY_DNS_RESOLVER       = "[fdaa::3]:53"  # Fly internal resolver; empty disables .internal forwarding
-  # FLY_DNS_EXCLUDE_SELF   = "true"          # NXDOMAIN this app's own *.internal so tailnet users use the Tailscale name (for identity)
-  #
-  # --- Advanced (defaults are fine) ---
-  # TS_ACCEPT_DNS          = "false"         # keep the node on Fly's resolver
-  # TS_ACCEPT_ROUTES       = "false"         # a router needn't consume other routes
-  # TS_SNAT_SUBNET_ROUTES  = "true"          # required so forwarded traffic gets replies
-  # TS_STATE_DIR           = "/tmp/tailscale"# tmpfs = ephemeral; re-auths each restart
-  # TS_SOCKET              = "/var/run/tailscale/tailscaled.sock"  # tailscaled API socket (WhoIs)
-  # TS_CONTROL_URL         = ""              # set for self-hosted Headscale
-  # TS_EXTRA_ARGS          = ""              # extra `tailscale up` flags
-  # UPSTREAM_CA_FILE       = "/etc/ssl/certs/ca-certificates.crt"
-  # FLY_LISTEN_HOST        = "[::]"          # bind for 6PN Postgres listeners; empty disables
-  # HTTP_PROXY_LISTEN      = "[::]:8080"     # HTTPS CONNECT proxy; empty disables
-  # DEBUG_PORT             = "80"            # dev page + /debug/vars; 0 disables
+  # TS_ADVERTISE_ROUTES  = "fdaa::/16"   # default: auto-derive the org /48
+  # FLY_DNS_EXCLUDE_SELF = "false"       # default: true
 
 [[vm]]
   size      = "shared-cpu-1x"
