@@ -1,8 +1,8 @@
 # pgproxy image. Two layers run side by side at runtime:
 #   - Fly/proxy (the `pgproxy` Go binary): pgproxy.go (pure Postgres wire
-#     proxy), managed.go (credential-injection mode), httpproxy.go (HTTPS
-#     CONNECT proxy), extensions.go (Fly config/dev page/source gating/
-#     application_name), fly-router.go (.internal DNS forwarder).
+#     proxy), credentials-manager.go (managed/credential-injection mode),
+#     httpproxy.go (HTTPS CONNECT proxy), fly.go (all Fly glue: config,
+#     dev page, source gating, application_name, .internal DNS forwarder).
 #   - fly-router (Tailscale): fly-router.sh runs tailscaled as a subnet
 #     router + exit node (modeled on fly-apps/tailscale-router).
 # entrypoint.sh wires them together. See project.md.

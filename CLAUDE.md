@@ -21,11 +21,10 @@ Fly egress IP) plus a small dev/reference page. It's a fork kept close to upstre
 ## The one hard rule: Tailscale and Fly code stay segregated
 
 - **Fly / proxy (Go) — no `tailscale.com` import:**
-  - `pgproxy.go`   — the **pure Postgres wire proxy** (strict upstream TLS, serve loop). Upstream-faithful; keep diff-minimal, hooks marked `// EXT`.
-  - `managed.go`   — **credential management** ("managed" mode): the proxy logs in to the upstream itself so clients connect credential-less.
-  - `httpproxy.go` — the **HTTPS `CONNECT` forward proxy** (outbound via the fixed Fly egress IP).
-  - `extensions.go`— Fly glue: multi-DB config, dev page, source gating (`classifyPeer`), `application_name` attribution (Fly PTR/TXT).
-  - `fly-router.go`— `.internal` DNS forwarder → Fly resolver (`fdaa::3`); Go half of the fly-router feature.
+  - `pgproxy.go`              — the **pure Postgres wire proxy** (strict upstream TLS, serve loop). Upstream-faithful; keep diff-minimal, hooks marked `// EXT`.
+  - `credentials-manager.go` — **credential management** ("managed" mode): the proxy logs in to the upstream itself so clients connect credential-less; also the shared StartupMessage read/detect helpers.
+  - `httpproxy.go`           — the **HTTPS `CONNECT` forward proxy** (outbound via the fixed Fly egress IP).
+  - `fly.go`                 — **all Fly glue**: multi-DB config, `runProxies` bootstrap, dev page, source gating (`classifyPeer`), `application_name` attribution (Fly PTR/TXT + StartupMessage rewrite), and the `.internal` DNS forwarder (Go companion to `fly-router.sh`).
 - **Tailscale / fly-router (shell/Docker, NOT Go):**
   - `fly-router.sh` + Dockerfile install lines — all `tailscaled` / `tailscale up` logic
     (the Fly subnet-router setup; modeled on `fly-apps/tailscale-router`).

@@ -6,8 +6,8 @@
 // This file is kept close to the upstream version at
 // https://github.com/tailscale/tailscale/blob/main/cmd/pgproxy/pgproxy.go
 // All Fly.io / application_name / HTTP-proxy customizations live in
-// extensions.go and httpproxy.go to make future upstream merges
-// straightforward.
+// fly.go, credentials-manager.go, and httpproxy.go to make future
+// upstream merges straightforward.
 package main
 
 import (
@@ -34,7 +34,7 @@ var (
 	debugPort  = flag.Int("debug-port", 80, "Listening port for the debug/metrics + dev page endpoint (Fly 6PN)")
 	upstreamCA = flag.String("upstream-ca-file", "", "File containing the PEM-encoded CA certificate for the upstream server")
 	// EXT: --port and --upstream-addr from upstream are replaced by
-	// the repeatable --upstream flag declared in extensions.go.
+	// the repeatable --upstream flag declared in fly.go.
 )
 
 func main() {
@@ -45,7 +45,7 @@ func main() {
 
 	// EXT BEGIN: debug listener + dev page, served over Fly 6PN. The
 	// per-upstream proxy creation, Expvar publication, and connection
-	// listeners are driven by runProxies in extensions.go (one proxy per
+	// listeners are driven by runProxies in fly.go (one proxy per
 	// configured database).
 	var debugMux *http.ServeMux
 	if *debugPort != 0 {
@@ -152,7 +152,7 @@ var (
 	// the single byte "S" before starting a normal TLS handshake.
 	sslStart = [8]byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}
 	// EXT: the fixed plaintextStart constant is replaced by
-	// isPlaintextStartup (managed.go), which accepts any v3
+	// isPlaintextStartup (credentials-manager.go), which accepts any v3
 	// StartupMessage length instead of exactly 86 bytes.
 )
 

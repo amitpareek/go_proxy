@@ -47,10 +47,9 @@ target's 6PN listener.
 | File | Role |
 |---|---|
 | `pgproxy.go` | Pure Postgres wire proxy: strict upstream TLS + serve loop. Upstream-faithful; customizations are `// EXT` hooks. |
-| `managed.go` | Credential management ("managed" mode): the proxy authenticates to the upstream itself so clients connect credential-less. |
+| `credentials-manager.go` | Credential management ("managed" mode): the proxy authenticates to the upstream itself so clients connect credential-less. Also the shared StartupMessage read/detect helpers. |
 | `httpproxy.go` | HTTPS `CONNECT` forward proxy (outbound via the fixed Fly egress IP). |
-| `extensions.go` | Fly glue: multi-DB config parsing, dev page, source gating (`classifyPeer`), `application_name` attribution (Fly PTR/TXT). |
-| `fly-router.go` | `.internal` DNS forwarder → Fly resolver (`fdaa::3`). Go half of the fly-router feature. |
+| `fly.go` | All Fly glue: multi-DB config parsing, `runProxies` bootstrap, dev page, source gating (`classifyPeer`), `application_name` attribution (Fly PTR/TXT + StartupMessage rewrite), and the `.internal` DNS forwarder (Go companion to `fly-router.sh`). |
 
 **fly-router / Tailscale layer — shell/Docker (no Go):**
 
@@ -127,6 +126,7 @@ early during implementation.
 
 - `main` @ `d0858c9` — tsnet-based (pre-migration).
 - Branch `approach-b` — Approach B implemented: Go is 6PN-only (no `tailscale.com`),
-  `fly-router.go` (DNS forwarder) added, `fly-router.sh` + orchestrator `entrypoint.sh` +
-  Dockerfile install tailscale. `go build`/`vet`/`test` pass; shell syntax checked.
+  `.internal` DNS forwarder lives in `fly.go`, `fly-router.sh` + orchestrator
+  `entrypoint.sh` + Dockerfile install tailscale. `go build`/`vet`/`test` pass; shell
+  syntax checked.
 - Next — deploy-verify on Fly (TUN + `ip_forward`), then merge to `main`.

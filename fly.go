@@ -1,25 +1,33 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// extensions.go contains the Fly.io + multi-database +
-// application_name + HTTP-proxy customizations layered on top of
-// upstream pgproxy. Keeping them out of pgproxy.go makes upstream
-// merges manageable; pgproxy.go itself stays close to
-// tailscale.com/cmd/pgproxy/pgproxy.go with a handful of EXT hooks.
+// fly.go is the Fly.io integration layer: ALL Fly-specific Go that
+// customizes upstream pgproxy lives here, so pgproxy.go stays close to
+// tailscale.com/cmd/pgproxy/pgproxy.go with only a few EXT hooks.
+// (Postgres credential injection lives in credentials-manager.go; the
+// HTTPS CONNECT proxy in httpproxy.go.)
 //
-// Added flags (declared below):
+// Contents, in order:
+//   - multi-database config: upstreamConfig + --destination-pg-dbs parsing
+//   - runProxies: the bootstrap that wires the per-DB listeners, the dev
+//     page, the HTTP CONNECT proxy, and the DNS forwarder
+//   - the dev / reference page (renderDevPage*)
+//   - source gating (classifyPeer) + application_name attribution
+//     (identifyClient + Fly PTR/TXT lookups + StartupMessage rewriting)
+//   - the *.internal DNS forwarder — the Go companion to fly-router.sh
+//     (which runs the tailscaled subnet router); together they are the
+//     "fly-router" feature that makes .internal reachable over Tailscale.
 //
-//	--destination-pg-dbs  JSON array of {name, listen, target}
-//	                      describing the Postgres databases this
-//	                      proxy fronts. Empty allowed: the proxy
-//	                      will still serve the dev page and HTTP
-//	                      CONNECT proxy.
-//	--fly-listen-host     Host (no port) to bind Fly 6PN listeners
-//	                      on; each entry provides its own port.
+// Added flags:
+//
+//	--destination-pg-dbs  JSON array of {name, listen, target} databases
+//	                      this proxy fronts. Empty allowed.
+//	--fly-listen-host     Host (no port) for Fly 6PN listeners.
 //	                      Default "[::]". Empty disables Fly listeners.
-//	--http-proxy-listen   Kernel TCP listen address for the HTTPS
-//	                      CONNECT forward proxy. Default "[::]:8080".
-//	                      Empty disables. Gated to Fly 6PN sources.
+//	--http-proxy-listen   Listen addr for the HTTPS CONNECT proxy.
+//	                      Default "[::]:8080". Empty disables.
+//	--fly-dns-resolver    Upstream Fly resolver for *.internal queries.
+//	                      Default via env "[fdaa::3]:53". Empty disables.
 package main
 
 import (
@@ -185,8 +193,8 @@ func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
 		go func() { log.Fatal(srv.Serve(ln)) }()
 	}
 
-	// EXT: serve *.internal DNS for tailnet clients (see fly-router.go).
-	// The real tailscaled subnet route is configured in fly-router.sh.
+	// EXT: serve *.internal DNS for tailnet clients (forwarder defined
+	// below). The real tailscaled subnet route is set up in fly-router.sh.
 	startFlyDNS()
 }
 
@@ -592,4 +600,115 @@ func parseVmsTXT(txts []string) map[string]string {
 		}
 	}
 	return out
+}
+
+// ─── .internal DNS forwarder (Go companion to fly-router.sh) ─────────────
+//
+// A tiny DNS forwarder that answers on [::]:53 (UDP+TCP) and relays every
+// query verbatim to Fly's internal resolver (--fly-dns-resolver, default
+// [fdaa::3]:53). It lets tailnet clients resolve *.internal names:
+// Tailscale split DNS sends the "internal" search domain to this node's
+// Tailscale IP, the query lands here, Fly's resolver answers with the 6PN
+// AAAA, and the tailscaled subnet route (configured in fly-router.sh, not
+// here) carries the connection. DNS messages are opaque to us — we just
+// shuttle bytes — so no DNS library is needed. No Tailscale dependency:
+// all Tailscale config lives in fly-router.sh.
+
+// dnsListen is where the forwarder binds. [::] covers every interface,
+// including the Tailscale one once tailscaled brings it up, so split-DNS
+// queries aimed at the node's Tailscale IP are received.
+const dnsListen = "[::]:53"
+
+var flyDNSResolver = flag.String("fly-dns-resolver", "",
+	`Upstream Fly internal DNS resolver (e.g. "[fdaa::3]:53") to forward *.internal queries to. Served on `+dnsListen+` (UDP+TCP). Empty disables the forwarder.`)
+
+// startFlyDNS launches the DNS forwarder if --fly-dns-resolver is set.
+// It is a no-op otherwise. Listener errors are fatal (a misconfigured
+// :53 bind should fail loudly at startup, not silently).
+func startFlyDNS() {
+	resolver := strings.TrimSpace(*flyDNSResolver)
+	if resolver == "" {
+		return
+	}
+
+	pc, err := net.ListenPacket("udp", dnsListen)
+	if err != nil {
+		log.Fatalf("dns udp listen on %s: %v", dnsListen, err)
+	}
+	go serveDNSUDP(pc, resolver)
+
+	ln, err := net.Listen("tcp", dnsListen)
+	if err != nil {
+		log.Fatalf("dns tcp listen on %s: %v", dnsListen, err)
+	}
+	go serveDNSTCP(ln, resolver)
+
+	log.Printf("serving .internal DNS on %s -> %s", dnsListen, resolver)
+}
+
+// serveDNSUDP forwards each received UDP DNS query to resolverAddr and
+// writes the answer back to the client.
+func serveDNSUDP(pc net.PacketConn, resolverAddr string) {
+	defer pc.Close()
+	for {
+		buf := make([]byte, 4096) // fits EDNS0-advertised sizes
+		n, src, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		go func(query []byte, src net.Addr) {
+			resp, err := forwardDNSUDP(query, resolverAddr)
+			if err != nil {
+				log.Printf("dns udp forward: %v", err)
+				return
+			}
+			if _, err := pc.WriteTo(resp, src); err != nil {
+				log.Printf("dns udp reply: %v", err)
+			}
+		}(buf[:n], src)
+	}
+}
+
+func forwardDNSUDP(query []byte, resolverAddr string) ([]byte, error) {
+	c, err := net.Dial("udp", resolverAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write(query); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, 4096)
+	n, err := c.Read(resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp[:n], nil
+}
+
+// serveDNSTCP proxies DNS-over-TCP connections to resolverAddr. The
+// 2-byte length framing is preserved transparently because we copy the
+// raw stream in both directions.
+func serveDNSTCP(ln net.Listener, resolverAddr string) {
+	defer ln.Close()
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			up, err := net.Dial("tcp", resolverAddr)
+			if err != nil {
+				log.Printf("dns tcp forward: %v", err)
+				return
+			}
+			defer up.Close()
+			done := make(chan struct{}, 2)
+			go func() { io.Copy(up, c); done <- struct{}{} }()
+			go func() { io.Copy(c, up); done <- struct{}{} }()
+			<-done
+		}(c)
+	}
 }

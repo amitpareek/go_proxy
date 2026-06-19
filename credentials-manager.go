@@ -1,11 +1,17 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// managed.go implements "managed" upstreams: entries in
+// credentials-manager.go implements "managed" upstreams: entries in
 // --destination-pg-dbs that carry credentials. For those, the proxy
 // authenticates to the upstream itself (SCRAM/md5/cleartext via
 // pgconn) and clients connect credential-less. The client's startup
 // user is ignored; only the database name is honored.
+//
+// It also holds the shared Postgres StartupMessage helpers used to read
+// the client's startup (parseStartupParams) and to detect a plaintext
+// vs TLS opening (isPlaintextStartup). The application_name *rewriting*
+// of the startup lives with the rest of the Fly attribution logic in
+// fly.go.
 package main
 
 import (

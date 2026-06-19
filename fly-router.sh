@@ -18,7 +18,7 @@
 #   2. the Linux kernel FORWARDS packets between the Tailscale interface
 #      and Fly 6PN (ip_forward).
 # A tailnet client then resolves <app>.internal (via Tailscale split DNS →
-# the pgproxy DNS forwarder, see fly-router.go) and routes the connection
+# the pgproxy DNS forwarder, see fly.go) and routes the connection
 # through this machine to the 6PN target.
 #
 # Why a REAL tailscaled (TUN), not userspace/tsnet:
@@ -30,11 +30,13 @@
 #
 # This is the Tailscale layer. Its sibling, the Fly/proxy layer, is the
 # `pgproxy` Go binary:
-#   pgproxy.go    pure Postgres wire proxy (strict upstream TLS)
-#   managed.go    managed mode: proxy logs in upstream, clients credential-less
-#   httpproxy.go  HTTPS CONNECT forward proxy (fixed Fly egress IP)
-#   extensions.go Fly config, dev page, source gating, application_name
-#   fly-router.go .internal DNS forwarder -> Fly resolver (Go half of fly-router)
+#   pgproxy.go              pure Postgres wire proxy (strict upstream TLS)
+#   credentials-manager.go  managed mode: proxy logs in upstream, clients
+#                           connect credential-less
+#   httpproxy.go            HTTPS CONNECT forward proxy (fixed Fly egress IP)
+#   fly.go                  all Fly glue: config, dev page, source gating,
+#                           application_name, AND the .internal DNS forwarder
+#                           (the Go companion to this script)
 # entrypoint.sh runs this script, then exec's pgproxy. See project.md.
 #
 # Config is env-driven (TS_* vars). Defaults below are what we run today;
