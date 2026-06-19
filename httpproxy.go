@@ -10,8 +10,6 @@ import (
 	"net"
 	"net/http"
 	"time"
-
-	"tailscale.com/metrics"
 )
 
 // httpProxy is an HTTPS CONNECT forward proxy gated to Fly 6PN
@@ -21,18 +19,18 @@ import (
 type httpProxy struct {
 	activeSessions  expvar.Int
 	startedSessions expvar.Int
-	errors          metrics.LabelMap
+	errors          *expvar.Map
 }
 
 func newHTTPProxy() *httpProxy {
-	return &httpProxy{errors: metrics.LabelMap{Label: "kind"}}
+	return &httpProxy{errors: new(expvar.Map)}
 }
 
 func (h *httpProxy) Expvar() expvar.Var {
-	s := &metrics.Set{}
+	s := new(expvar.Map)
 	s.Set("sessions_active", &h.activeSessions)
 	s.Set("sessions_started", &h.startedSessions)
-	s.Set("session_errors", &h.errors)
+	s.Set("session_errors", h.errors)
 	return s
 }
 

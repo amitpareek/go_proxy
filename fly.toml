@@ -1,32 +1,29 @@
 # Fly.io configuration for pgproxy.
 #
+# pgproxy runs a real tailscaled (TUN) as a Fly 6PN subnet router + exit
+# node, alongside a 6PN-only Postgres proxy. Tailnet users reach Fly apps
+# (incl. pgproxy) via *.internal once split DNS is configured. See
+# project.md for the architecture and the full config table.
+#
 # Before first deploy:
 #
 #   fly apps create pgproxy
-#   fly secrets set TS_AUTHKEY="tskey-auth-..."
+#   fly secrets set TS_AUTHKEY="tskey-auth-..."        # ephemeral+reusable+tagged
 #   fly deploy
 #
-# The proxy will start up with no databases configured. Open
-# http://pgproxy/ (over Tailscale) for the dev reference page and
-# copy the example into a `fly secrets set DESTINATION_PG_DBS='...'`
-# command when you're ready to add databases:
+# Then, one-time in the Tailscale admin console:
+#   - approve the advertised routes (or grant an autoApprovers ACL to the tag)
+#   - split DNS: "internal" search domain -> this node's Tailscale IP
 #
+# Add databases later (secret; contains passwords):
 #   fly secrets set DESTINATION_PG_DBS='[
-#     {"name":"rw","listen":5432,
-#      "target":"ep-xxx.aws.neon.tech:5432",
+#     {"name":"rw","listen":5432,"target":"ep-xxx.aws.neon.tech:5432",
 #      "dbname":"main","user":"app_user","password":"..."},
-#     {"name":"admin","listen":5439,
-#      "target":"ep-xxx.aws.neon.tech:5432"}
+#     {"name":"admin","listen":5439,"target":"ep-xxx.aws.neon.tech:5432"}
 #   ]'
 #   fly deploy
 #
-# Entries with user+password are "managed": the proxy authenticates
-# upstream itself and clients connect with no credentials, e.g.
-# postgres://pgproxy.internal:5432/mydb. Entries without are
-# passthrough (client supplies real upstream credentials).
-#
-# Use an *ephemeral + reusable* Tailscale auth key; state lives in
-# /tmp (tmpfs), so each restart re-auths.
+# Secrets (never put these in [env]): TS_AUTHKEY, DESTINATION_PG_DBS.
 
 app = "pgproxy"
 primary_region = "sin"
@@ -35,16 +32,33 @@ primary_region = "sin"
   dockerfile = "Dockerfile"
 
 [env]
-  # Non-secret defaults; uncomment to override.
-  # UPSTREAM_CA_FILE = "/etc/ssl/certs/ca-certificates.crt"
-  # STATE_DIR        = "/tmp/tsnet"
-  # TS_HOSTNAME      = "pgproxy"
+  # Zero-config: only TS_AUTHKEY (secret) is required. The defaults below
+  # are what we run today — uncomment only to override. Rationale for each
+  # default is in project.md.
+  #
+  # --- Common ---
+  # TS_HOSTNAME            = "..."           # default: $FLY_MACHINE_ID-$FLY_REGION-$FLY_APP_NAME
+  # TS_ADVERTISE_ROUTES    = ""              # default: auto-derive org /48 from fly-local-6pn; or "fdaa::/16"
+  # TS_ADVERTISE_EXIT_NODE = "true"          # every machine usable as a region-specific exit node
+  # FLY_DNS_RESOLVER       = "[fdaa::3]:53"  # Fly internal resolver; empty disables .internal forwarding
+  #
+  # --- Advanced (defaults are fine) ---
+  # TS_ACCEPT_DNS          = "false"         # keep the node on Fly's resolver
+  # TS_ACCEPT_ROUTES       = "false"         # a router needn't consume other routes
+  # TS_SNAT_SUBNET_ROUTES  = "true"          # required so forwarded traffic gets replies
+  # TS_STATE_DIR           = "/tmp/tailscale"# tmpfs = ephemeral; re-auths each restart
+  # TS_CONTROL_URL         = ""              # set for self-hosted Headscale
+  # TS_EXTRA_ARGS          = ""              # extra `tailscale up` flags
+  # UPSTREAM_CA_FILE       = "/etc/ssl/certs/ca-certificates.crt"
+  # FLY_LISTEN_HOST        = "[::]"          # bind for 6PN Postgres listeners; empty disables
+  # HTTP_PROXY_LISTEN      = "[::]:8080"     # HTTPS CONNECT proxy; empty disables
+  # DEBUG_PORT             = "80"            # dev page + /debug/vars; 0 disables
 
 [[vm]]
   size      = "shared-cpu-1x"
   memory_mb = 512
 
-# No [[services]] block: pgproxy is internal-only. Postgres on the
-# per-database listen ports over 6PN/Tailscale; HTTPS CONNECT proxy
-# on 8080 (Fly 6PN only); debug + dev reference page on 80
-# (Tailscale only).
+# No [[services]] block: pgproxy is internal-only. Postgres (per-db listen
+# ports), HTTPS CONNECT (8080), debug/dev page (80), and the .internal DNS
+# forwarder (53) are reached over Fly 6PN and, for the tailnet, through this
+# machine's own Tailscale subnet router.

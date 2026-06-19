@@ -42,14 +42,10 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"tailscale.com/client/local"
-	"tailscale.com/ipn"
-	"tailscale.com/tsnet"
 )
 
 // upstreamConfig describes one named Postgres upstream. The proxy
-// listens on Listen (on both Tailscale and Fly 6PN) and forwards to
+// listens on Listen (Fly 6PN) and forwards to
 // Target. If User and Password are set the entry is "managed": the
 // proxy itself authenticates to the upstream with those credentials
 // and clients connect credential-less (their startup user is
@@ -72,194 +68,7 @@ var (
 	destinationPgDbs = flag.String("destination-pg-dbs", "", `JSON array of {"name","listen","target"} entries. Empty is allowed.`)
 	flyListenHost    = flag.String("fly-listen-host", "[::]", "Host (no port) to bind Fly 6PN listeners on. Empty disables Fly listeners.")
 	httpProxyListen  = flag.String("http-proxy-listen", "[::]:8080", "Kernel TCP listen address for the HTTPS CONNECT forward proxy. Empty disables.")
-
-	advertiseRoutes   = flag.String("advertise-routes", "", "Comma-separated CIDRs to advertise as a subnet router (e.g. Fly 6PN fdaa::/16). Empty advertises none.")
-	advertiseExitNode = flag.Bool("advertise-exit-node", false, "Advertise this node as a Tailscale exit node (adds 0.0.0.0/0 and ::/0).")
-	flyDNSResolver    = flag.String("fly-dns-resolver", "", `Upstream Fly internal DNS resolver (e.g. "[fdaa::3]:53"). When set, serve DNS on the node's Tailscale IPs (:53 UDP+TCP) and forward queries here, so tailnet clients with split DNS can resolve *.internal. Empty disables.`)
 )
-
-// setupTailscaleRouter turns this tsnet node into a Fly 6PN router for
-// the tailnet. With --advertise-routes / --advertise-exit-node it
-// announces subnet routes (and/or the exit node); with --fly-dns-resolver
-// it also serves DNS that forwards to Fly's internal resolver so clients
-// can resolve <app>.internal names. tsnet runs netstack with
-// ProcessSubnets and ProcessLocalIPs enabled, so advertised traffic is
-// actually forwarded out via the host network.
-//
-// To actually reach a Fly app over Tailscale you need BOTH halves:
-//   - the route, so the resolved fdaa::/16 address is reachable; and
-//   - the DNS forwarder + Tailscale split DNS (admin console > DNS > add
-//     nameserver = this node's Tailscale IP, restricted to search domain
-//     "internal"), so the name resolves at all.
-//
-// Routes/exit nodes still have to be approved in the tailnet before they
-// carry traffic: tick them in the admin console or grant the node's tags
-// an autoApprovers ACL.
-//
-// When nothing is configured this is a no-op and the node starts lazily
-// via the first Listen, exactly as upstream pgproxy does.
-func setupTailscaleRouter(ctx context.Context, ts *tsnet.Server, tsclient *local.Client) error {
-	routes, err := parseAdvertiseRoutes(*advertiseRoutes)
-	if err != nil {
-		return err
-	}
-	wantPrefs := len(routes) > 0 || *advertiseExitNode
-	resolver := strings.TrimSpace(*flyDNSResolver)
-	wantDNS := resolver != ""
-	if !wantPrefs && !wantDNS {
-		return nil
-	}
-
-	// Wait until the node is Running before editing prefs / reading the
-	// node's Tailscale IPs.
-	if _, err := ts.Up(ctx); err != nil {
-		return fmt.Errorf("bringing tailscale up: %w", err)
-	}
-
-	if wantPrefs {
-		prefs := &ipn.Prefs{AdvertiseRoutes: routes}
-		if *advertiseExitNode {
-			prefs.SetAdvertiseExitNode(true) // appends 0.0.0.0/0 and ::/0
-		}
-		if _, err := tsclient.EditPrefs(ctx, &ipn.MaskedPrefs{
-			Prefs:              *prefs,
-			AdvertiseRoutesSet: true,
-		}); err != nil {
-			return fmt.Errorf("advertising routes: %w", err)
-		}
-		log.Printf("advertising routes %v (exit node: %v)", prefs.AdvertiseRoutes, *advertiseExitNode)
-	}
-
-	if wantDNS {
-		if err := serveFlyDNS(ctx, ts, tsclient, resolver); err != nil {
-			return fmt.Errorf("serving DNS: %w", err)
-		}
-	}
-	return nil
-}
-
-// serveFlyDNS listens on every Tailscale IP of the node (port 53, both
-// UDP and TCP) and forwards each query verbatim to Fly's internal
-// resolver at resolverAddr. DNS messages are opaque to us — we just
-// shuttle bytes — so no DNS library is needed. Point Tailscale split DNS
-// at one of these IPs for the "internal" search domain and *.internal
-// names resolve to their 6PN addresses.
-func serveFlyDNS(ctx context.Context, ts *tsnet.Server, tsclient *local.Client, resolverAddr string) error {
-	st, err := tsclient.Status(ctx)
-	if err != nil {
-		return fmt.Errorf("getting tailscale status: %w", err)
-	}
-	if len(st.TailscaleIPs) == 0 {
-		return fmt.Errorf("node has no Tailscale IPs yet")
-	}
-	for _, ip := range st.TailscaleIPs {
-		addr := net.JoinHostPort(ip.String(), "53")
-
-		pc, err := ts.ListenPacket("udp", addr)
-		if err != nil {
-			return fmt.Errorf("dns udp listen on %s: %w", addr, err)
-		}
-		go serveDNSUDP(pc, resolverAddr)
-
-		ln, err := ts.Listen("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("dns tcp listen on %s: %w", addr, err)
-		}
-		go serveDNSTCP(ln, resolverAddr)
-
-		log.Printf("serving DNS on %s -> %s", addr, resolverAddr)
-	}
-	return nil
-}
-
-// serveDNSUDP forwards each received UDP DNS query to resolverAddr and
-// writes the answer back to the client.
-func serveDNSUDP(pc net.PacketConn, resolverAddr string) {
-	defer pc.Close()
-	for {
-		buf := make([]byte, 4096) // fits EDNS0-advertised sizes
-		n, src, err := pc.ReadFrom(buf)
-		if err != nil {
-			return
-		}
-		go func(query []byte, src net.Addr) {
-			resp, err := forwardDNSUDP(query, resolverAddr)
-			if err != nil {
-				log.Printf("dns udp forward: %v", err)
-				return
-			}
-			if _, err := pc.WriteTo(resp, src); err != nil {
-				log.Printf("dns udp reply: %v", err)
-			}
-		}(buf[:n], src)
-	}
-}
-
-func forwardDNSUDP(query []byte, resolverAddr string) ([]byte, error) {
-	c, err := net.Dial("udp", resolverAddr)
-	if err != nil {
-		return nil, err
-	}
-	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := c.Write(query); err != nil {
-		return nil, err
-	}
-	resp := make([]byte, 4096)
-	n, err := c.Read(resp)
-	if err != nil {
-		return nil, err
-	}
-	return resp[:n], nil
-}
-
-// serveDNSTCP proxies DNS-over-TCP connections to resolverAddr. The
-// 2-byte length framing is preserved transparently because we copy the
-// raw stream in both directions.
-func serveDNSTCP(ln net.Listener, resolverAddr string) {
-	defer ln.Close()
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		go func(c net.Conn) {
-			defer c.Close()
-			up, err := net.Dial("tcp", resolverAddr)
-			if err != nil {
-				log.Printf("dns tcp forward: %v", err)
-				return
-			}
-			defer up.Close()
-			done := make(chan struct{}, 2)
-			go func() { io.Copy(up, c); done <- struct{}{} }()
-			go func() { io.Copy(c, up); done <- struct{}{} }()
-			<-done
-		}(c)
-	}
-}
-
-// parseAdvertiseRoutes parses a comma-separated list of CIDRs. Empty or
-// whitespace yields a nil slice and no error.
-func parseAdvertiseRoutes(s string) ([]netip.Prefix, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, nil
-	}
-	var out []netip.Prefix
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		p, err := netip.ParsePrefix(part)
-		if err != nil {
-			return nil, fmt.Errorf("invalid CIDR %q: %v", part, err)
-		}
-		out = append(out, p.Masked())
-	}
-	return out, nil
-}
 
 // parseDestinationPgDbs parses the --destination-pg-dbs flag value as
 // a JSON array of upstreamConfig and validates each entry. An empty
@@ -316,12 +125,11 @@ func parseDestinationPgDbsJSON(raw string) ([]upstreamConfig, error) {
 }
 
 // runProxies parses --destination-pg-dbs, creates one proxy per
-// entry (sharing the upstream CA + tsclient), starts the Tailscale
-// and Fly 6PN listeners for each, registers the dev page on the
-// debug mux, and brings up the HTTP CONNECT proxy. It is tolerant of
-// an empty database list — first launch will commonly have none
-// until secrets are set.
-func runProxies(ts *tsnet.Server, tsclient *local.Client, upstreamCAPath string, debugMux *http.ServeMux) {
+// entry (sharing the upstream CA), starts the Fly 6PN listener for
+// each, registers the dev page on the debug mux, and brings up the
+// HTTP CONNECT proxy. It is tolerant of an empty database list — first
+// launch will commonly have none until secrets are set.
+func runProxies(upstreamCAPath string, debugMux *http.ServeMux) {
 	cfgs, err := parseDestinationPgDbs()
 	if err != nil {
 		log.Fatalf("--destination-pg-dbs: %v", err)
@@ -329,9 +137,12 @@ func runProxies(ts *tsnet.Server, tsclient *local.Client, upstreamCAPath string,
 	if len(cfgs) == 0 {
 		log.Printf("no Postgres databases configured. Set DESTINATION_PG_DBS to a JSON array (see the dev page on the debug port).")
 	}
+	if *flyListenHost == "" {
+		log.Printf("warning: --fly-listen-host is empty, so no Postgres listeners will be started.")
+	}
 
 	for _, u := range cfgs {
-		p, err := newProxy(u.Target, upstreamCAPath, tsclient)
+		p, err := newProxy(u.Target, upstreamCAPath)
 		if err != nil {
 			log.Fatalf("db %q: %v", u.Name, err)
 		}
@@ -340,13 +151,6 @@ func runProxies(ts *tsnet.Server, tsclient *local.Client, upstreamCAPath string,
 			log.Printf("db %q: managed mode, upstream user %q default db %q", u.Name, u.User, u.DBName)
 		}
 		expvar.Publish("pgproxy_"+u.Name, p.Expvar())
-
-		tsLn, err := ts.Listen("tcp", fmt.Sprintf(":%d", u.Listen))
-		if err != nil {
-			log.Fatalf("tailscale listen for %q on :%d: %v", u.Name, u.Listen, err)
-		}
-		log.Printf("db %q: Tailscale :%d -> %s", u.Name, u.Listen, u.Target)
-		go func(p *proxy, ln net.Listener) { log.Fatal(p.Serve(ln)) }(p, tsLn)
 
 		if *flyListenHost != "" {
 			addr := net.JoinHostPort(strings.Trim(*flyListenHost, "[]"), strconv.Itoa(u.Listen))
@@ -365,7 +169,7 @@ func runProxies(ts *tsnet.Server, tsclient *local.Client, upstreamCAPath string,
 				http.NotFound(w, r)
 				return
 			}
-			renderDevPage(w, ts, cfgs)
+			renderDevPage(w, cfgs)
 		})
 	}
 
@@ -380,32 +184,27 @@ func runProxies(ts *tsnet.Server, tsclient *local.Client, upstreamCAPath string,
 		log.Printf("serving HTTP CONNECT proxy on %s", *httpProxyListen)
 		go func() { log.Fatal(srv.Serve(ln)) }()
 	}
+
+	// EXT: serve *.internal DNS for tailnet clients (see flydns.go). The
+	// real tailscaled subnet route is configured in tailscale-up.sh.
+	startFlyDNS()
 }
 
 // renderDevPage writes a small HTML reference page listing the
-// configured databases with their Tailscale and Fly 6PN connection
-// URLs and target host:port. It also documents how to add/modify
-// databases and how to use the HTTP CONNECT proxy. Passwords are
-// never displayed.
-func renderDevPage(w http.ResponseWriter, ts *tsnet.Server, cfgs []upstreamConfig) {
-	tsHost := ts.Hostname
-	if tsclient, err := ts.LocalClient(); err == nil {
-		if st, err := tsclient.Status(context.Background()); err == nil && st != nil && st.Self != nil {
-			if dn := strings.TrimSuffix(st.Self.DNSName, "."); dn != "" {
-				tsHost = dn
-			}
-		}
-	}
+// configured databases with their Fly 6PN connection URLs and target
+// host:port. It also documents how to add/modify databases and how to
+// use the HTTP CONNECT proxy. Passwords are never displayed.
+func renderDevPage(w http.ResponseWriter, cfgs []upstreamConfig) {
 	flyApp := os.Getenv("FLY_APP_NAME")
 	flyHost := "pgproxy.internal"
 	if flyApp != "" {
 		flyHost = flyApp + ".internal"
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(renderDevPageHTML(tsHost, flyHost, cfgs))
+	w.Write(renderDevPageHTML(flyHost, cfgs))
 }
 
-func renderDevPageHTML(tsHost, flyHost string, cfgs []upstreamConfig) []byte {
+func renderDevPageHTML(flyHost string, cfgs []upstreamConfig) []byte {
 	sorted := append([]upstreamConfig(nil), cfgs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Listen < sorted[j].Listen })
 
@@ -444,7 +243,7 @@ th { color: #666; font-weight: normal; width: 8em; }
 .warn { background: #fff5d6; padding: 10px 12px; border-radius: 4px; border: 1px solid #f0d990; }
 </style></head><body>
 <h1>pgproxy</h1>
-<p class="note">Reachable to Fly apps over 6PN and to humans over Tailscale.</p>
+<p class="note">Reachable to Fly apps over 6PN (and to the tailnet via a separate Tailscale subnet router).</p>
 
 <h2>Databases</h2>
 `)
@@ -469,14 +268,12 @@ as a Fly secret to add some — see <em>Configure</em> below.
 					connPath = "/" + u.DBName
 				}
 				fmt.Fprintf(&b, "<tr><th>Fly 6PN</th><td><code>postgres://%s:%d%s</code></td></tr>\n", html.EscapeString(flyHost), u.Listen, html.EscapeString(connPath))
-				fmt.Fprintf(&b, "<tr><th>Tailscale</th><td><code>postgres://%s:%d%s</code></td></tr>\n", html.EscapeString(tsHost), u.Listen, html.EscapeString(connPath))
 				fmt.Fprintf(&b, "<tr><th>Upstream user</th><td><code>%s</code> <span class=\"note\">(injected by the proxy; no client credentials needed)</span></td></tr>\n", html.EscapeString(u.User))
 				if u.DBName != "" {
 					fmt.Fprintf(&b, "<tr><th>Default db</th><td><code>%s</code> <span class=\"note\">(override with any db name in the connection string)</span></td></tr>\n", html.EscapeString(u.DBName))
 				}
 			} else {
 				fmt.Fprintf(&b, "<tr><th>Fly 6PN</th><td><code>%s:%d</code> <span class=\"note\">(client must supply real upstream credentials)</span></td></tr>\n", html.EscapeString(flyHost), u.Listen)
-				fmt.Fprintf(&b, "<tr><th>Tailscale</th><td><code>%s:%d</code></td></tr>\n", html.EscapeString(tsHost), u.Listen)
 			}
 			fmt.Fprintf(&b, "<tr><th>Target</th><td class=\"target\"><code>%s</code></td></tr>\n", html.EscapeString(u.Target))
 			b.WriteString("</table>\n")
@@ -505,13 +302,13 @@ choices: <code>5432</code> for the primary writer, <code>5433</code> for the fir
 read-only, <code>5434</code> and up for additional read replicas. After
 deploying, the entry shows up in <em>Databases</em> above and is
 reachable at <code>` + html.EscapeString(flyHost) + `:&lt;listen&gt;</code> from Fly
-apps or <code>` + html.EscapeString(tsHost) + `:&lt;listen&gt;</code> from Tailscale.</p>
+apps (or via a Tailscale subnet router pointed at Fly 6PN).</p>
 
 <h2>HTTP CONNECT proxy</h2>
 <p>For outbound HTTPS calls that need to come from this app's fixed
 Fly egress IP (e.g. IP-allowlisted vendors), use the binary's HTTPS
 <code>CONNECT</code> forward proxy on <code>` + html.EscapeString(flyHost) + `:8080</code>.
-Access is gated to Fly 6PN; Tailscale clients get <code>403</code>.</p>
+Access is gated to Fly 6PN; other sources get <code>403</code>.</p>
 <pre>curl -x http://` + html.EscapeString(flyHost) + `:8080 https://some-vendor.example.com/</pre>
 
 <h2>application_name attribution</h2>
@@ -520,7 +317,6 @@ the proxy injects one derived from the peer's identity:</p>
 <ul>
 <li>Fly 6PN clients: <code>&lt;region&gt;.&lt;app&gt;</code>
 (derived from PTR + <code>vms.&lt;app&gt;.internal</code> TXT).</li>
-<li>Tailscale clients: your tailnet login (or tag list).</li>
 </ul>
 <p>This shows up in <code>pg_stat_activity.application_name</code> on Neon, so
 you can attribute traffic and spot noisy neighbors.</p>
@@ -536,14 +332,11 @@ type peerKind int
 
 const (
 	peerReject peerKind = iota
-	peerTailscale
 	peerFly
 )
 
 func (k peerKind) String() string {
 	switch k {
-	case peerTailscale:
-		return "tailscale"
 	case peerFly:
 		return "fly"
 	default:
@@ -551,14 +344,13 @@ func (k peerKind) String() string {
 	}
 }
 
-var (
-	flyPrefix   = netip.MustParsePrefix("fdaa::/16")
-	tailscaleV4 = netip.MustParsePrefix("100.64.0.0/10")
-	tailscaleV6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
-)
+var flyPrefix = netip.MustParsePrefix("fdaa::/16")
 
 // classifyPeer returns the peerKind for a remote address string of
-// the form "host:port" or "[ipv6]:port".
+// the form "host:port" or "[ipv6]:port". Only Fly 6PN sources are
+// accepted; everything else (including traffic relayed in from a
+// Tailscale subnet router, which is SNATed to a 6PN address) is judged
+// by its source IP.
 func classifyPeer(remote string) peerKind {
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {
@@ -569,11 +361,8 @@ func classifyPeer(remote string) peerKind {
 		return peerReject
 	}
 	ip = ip.Unmap()
-	switch {
-	case flyPrefix.Contains(ip):
+	if flyPrefix.Contains(ip) {
 		return peerFly
-	case tailscaleV4.Contains(ip), tailscaleV6.Contains(ip):
-		return peerTailscale
 	}
 	return peerReject
 }
@@ -582,30 +371,6 @@ func classifyPeer(remote string) peerKind {
 // to log plus the application_name to inject.
 func (p *proxy) identifyClient(ctx context.Context, c net.Conn) (user, machine, appName string, err error) {
 	switch classifyPeer(c.RemoteAddr().String()) {
-	case peerTailscale:
-		whois, werr := p.client.WhoIs(ctx, c.RemoteAddr().String())
-		if werr != nil {
-			p.errors.Add("whois-failed", 1)
-			return "", "", "", fmt.Errorf("getting client identity: %v", werr)
-		}
-		if whois.Node != nil {
-			if whois.Node.Hostinfo.ShareeNode() {
-				machine = "external-device"
-			} else {
-				machine = strings.TrimSuffix(whois.Node.Name, ".")
-			}
-		}
-		if whois.UserProfile != nil {
-			user = whois.UserProfile.LoginName
-			if user == "tagged-devices" && whois.Node != nil {
-				user = strings.Join(whois.Node.Tags, ",")
-			}
-		}
-		if user == "" || machine == "" {
-			p.errors.Add("no-ts-identity", 1)
-			return "", "", "", fmt.Errorf("couldn't identify source user and machine (user %q, machine %q)", user, machine)
-		}
-		return user, machine, user, nil
 	case peerFly:
 		host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
 		ip, _ := netip.ParseAddr(host)
